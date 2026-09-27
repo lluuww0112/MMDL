@@ -51,5 +51,3 @@ bash scripts/run_mmmu_eval.sh --mode ours --seeds 42 --limit 2 --out_dir results
 | max_new_tokens | 16384 | 모델 카드 VL 권장값 |
 | 이미지 해상도 | min 1280×28×28, max 5120×28×28 픽셀 | Qwen 공식 코드 |
 | seed | 42, 3407, 1234 (문제별 고정: `seed × 100000 + 문제번호`) | |
-
-실험은 로컬 저장소 커밋 `d5420a8`과 같은 코드로 실행했어요.
