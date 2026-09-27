@@ -93,6 +93,7 @@ def _load_config(path: Path) -> dict[str, Any]:
     evaluation = _config_section(config, "evaluation")
     generation = _config_section(config, "generation")
     image = _config_section(config, "image")
+    prompt = _config_section(config, "prompt")
     return {
         "model_path": model.get("path"),
         "model_revision": model.get("revision", DEFAULT_MODEL_REVISION),
@@ -113,6 +114,7 @@ def _load_config(path: Path) -> dict[str, Any]:
         "max_new_tokens": generation.get("max_new_tokens", 32768),
         "min_pixels": image.get("min_pixels"),
         "max_pixels": image.get("max_pixels"),
+        "conversation": prompt.get("conversation", "qwen3_vl_mmmu"),
     }
 
 
@@ -188,6 +190,7 @@ def _parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--seed", type=int, default=config_defaults["seed"])
     parser.add_argument("--min-pixels", type=int, default=config_defaults["min_pixels"])
     parser.add_argument("--max-pixels", type=int, default=config_defaults["max_pixels"])
+    parser.add_argument("--conversation", default=config_defaults["conversation"])
     parser.add_argument(
         "--output-path",
         type=Path,
@@ -212,6 +215,7 @@ def _model_args(args: argparse.Namespace) -> str:
         f"repetition_penalty={args.repetition_penalty}",
         f"presence_penalty={args.presence_penalty}",
         f"seed={args.seed}",
+        f"conversation={args.conversation}",
     ]
     if not args.model_path or args.model_path == DEFAULT_MODEL:
         values.append(f"revision={args.model_revision}")
@@ -260,7 +264,9 @@ def main() -> int:
         "--model_args",
         _model_args(args),
         "--tasks",
-        "mmmu_val",
+        # Use lmms-eval's Qwen3-VL-specific MMMU prompt template.  The generic
+        # task would be selected for the custom project_qwen3_vl model id.
+        "mmmu_val_qwen",
         "--batch_size",
         str(args.batch_size),
         "--log_samples",

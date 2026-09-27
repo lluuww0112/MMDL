@@ -24,9 +24,13 @@ generation:
   repetition_penalty: 1.0
   presence_penalty: 1.5
   seed: 3407
-  max_new_tokens: 32768
+  max_new_tokens: 128 # official 32768
+
+prompt:
+  # Fixed presets are defined in model/conversation.py.
+  conversation: qwen3_vl_mmmu
 
 image:
-  # Qwen visual-token range: 256 to 1280 patches at 28x28 pixels each.
-  min_pixels: 200704
-  max_pixels: 1003520
+  # Official Qwen3-VL MMMU recipe: 1280 to 5120 patches at 28x28 pixels each.
+  min_pixels: 1003520
+  max_pixels: 4014080

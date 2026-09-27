@@ -18,6 +18,7 @@ from lmms_eval.api.model import lmms
 from lmms_eval.api.registry import register_model
 from tqdm import tqdm
 
+from model.conversation import Conversation, get_conversation
 from model.qwen_arch import Qwen3VLArchitecture
 
 
@@ -110,7 +111,7 @@ class ProjectQwen3VL(lmms):
         device_map: str | None = None,
         torch_dtype: str | None = None,
         attn_implementation: str | None = "sdpa",
-        system_prompt: str | None = "You are a helpful assistant.",
+        conversation: str = "qwen3_vl_mmmu",
         max_new_tokens: int = 1024,
         do_sample: bool = True,
         temperature: float = 0.7,
@@ -125,7 +126,7 @@ class ProjectQwen3VL(lmms):
     ) -> None:
         super().__init__()
         self.batch_size_per_gpu = int(batch_size)
-        self.system_prompt = system_prompt
+        self.conversation: Conversation = get_conversation(conversation)
         self.max_new_tokens = int(max_new_tokens)
         self.default_generation_kwargs = {
             "do_sample": do_sample,
@@ -181,26 +182,27 @@ class ProjectQwen3VL(lmms):
 
                 generation_kwargs = dict(generation_kwargs)
                 generation_kwargs.pop("until", None)
-                max_new_tokens = int(
-                    generation_kwargs.pop(
-                        "max_new_tokens",
-                        generation_kwargs.pop("max_gen_toks", self.max_new_tokens),
-                    )
-                )
+                # The project recipe is the source of truth.  In particular,
+                # MMMU's lmms-eval task carries a 128-token task default, which
+                # must not override the requested Qwen3-VL generation limit.
+                generation_kwargs.pop("max_new_tokens", None)
+                generation_kwargs.pop("max_gen_toks", None)
+                max_new_tokens = self.max_new_tokens
                 # The config is the evaluation recipe source of truth, rather
                 # than task defaults supplied by lmms-eval.
                 generation_kwargs.update(self.default_generation_kwargs)
+                prompt = self.conversation.render(document, fallback=context)
                 messages = self.architecture.build_messages(
-                    context,
+                    prompt,
                     images=visuals,
-                    system_prompt=self.system_prompt,
+                    system_prompt=self.conversation.system_prompt,
                 )
                 response = self.architecture.generate_from_messages(
                     messages,
                     max_new_tokens=max_new_tokens,
                     **generation_kwargs,
                 )
-                self.cache_hook.add_partial("generate_until", (context, generation_kwargs), response)
+                self.cache_hook.add_partial("generate_until", (prompt, generation_kwargs), response)
                 responses.append(response)
                 progress.update(1)
         finally:
