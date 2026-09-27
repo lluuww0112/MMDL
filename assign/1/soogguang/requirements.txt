@@ -1,0 +1,9 @@
+# Qwen3-VL 지원 최소 버전(README: vllm>=0.11.0, transformers>=4.57.0) 기준으로 고정.
+# 실제 실행 환경은 results/<mode>/pip_freeze.txt 에 자동 기록됨.
+vllm==0.11.0            # torch 2.8.0 을 함께 설치함
+transformers==4.57.1
+qwen-vl-utils==0.0.14   # 공식 코드 주석: 0.0.14+ 필요 (image_patch_size 인자)
+datasets==3.6.0
+pillow
+numpy
+requests
