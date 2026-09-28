@@ -47,6 +47,7 @@ def config_defaults(path: Path) -> dict:
         "max_num_seqs": model.get("max_num_seqs", 64),
         "tensor_parallel_size": model.get("tensor_parallel_size", 1),
         "enforce_eager": model.get("enforce_eager", False),
+        "dataset_revision": evaluation.get("revision", DATASET_REVISION),
         "batch_size": evaluation.get("batch_size", 1),
         "max_new_tokens": generation.get("max_new_tokens", 16384),
         "do_sample": generation.get("do_sample", True),
@@ -71,7 +72,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", default=values["model_path"])
     parser.add_argument("--model-revision", default=values["revision"])
     parser.add_argument("--dataset-path", default=DATASET)
-    parser.add_argument("--dataset-revision", default=DATASET_REVISION)
+    parser.add_argument("--dataset-revision", default=values["dataset_revision"])
     parser.add_argument("--backend", "--inference-backend", choices=("vllm",), default="vllm")
     parser.add_argument("--dtype", choices=sorted(DTYPES), default=values["dtype"])
     parser.add_argument("--vllm-gpu-memory-utilization", "--vllm-gpu-util", type=float, default=values["gpu_util"])
@@ -237,7 +238,8 @@ def main() -> int:
             print(f"[vLLM] {subject:40s} {len(records):3d} samples {timing[subject]:7.1f}s")
     scores_path, summary_path, summary = write_scores(predictions, output_path)
     (output_path / "predictions_meta.json").write_text(json.dumps({
-        "args": vars(args), "num_questions": len(predictions), "timing_sec_by_subject": timing,
+        "args": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
+        "num_questions": len(predictions), "timing_sec_by_subject": timing,
         "total_sec": time.monotonic() - total_started,
     }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     macro = summary["overall_macro"]

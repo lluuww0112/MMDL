@@ -12,6 +12,7 @@ model:
   dtype: bf16
 
 evaluation:
+  revision: 98e6ac0cb9b7b2cd2c991b85a50762edc4aedc68 # Pinned MMMU dataset revision.
   batch_size: 1
   num_processes: 1
   main_process_port: 12346
@@ -24,7 +25,7 @@ generation:
   top_k: 20
   repetition_penalty: 1.0
   presence_penalty: 1.5
-  seed: 3407
+  seed: 42
   max_new_tokens: 32768 # official 32768
 
 prompt: # Fixed presets are defined in model/conversation.py.
