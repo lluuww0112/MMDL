@@ -1,6 +1,6 @@
 # MMMU-val Baseline Evaluation Report — Qwen3-VL-4B-Instruct
 
-- **팀명**: 천재고양이
+- **팀명**: 행운고양이
 - **팀원**: 박수빈, 윤세혁, 우재연, 장수인
 - **작성일**: 2026-09-27
 - **재현 커맨드**: `bash assign/1/scripts/run_mmmu_eval.sh --mode ours --model_path Qwen/Qwen3-VL-4B-Instruct --data_path MMMU/MMMU --seeds "42 3407 1234" --out_dir results --gpu_memory_utilization 0.85`
