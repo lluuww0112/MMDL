@@ -6,8 +6,9 @@ model:
   revision: ebb281ec70b05090aa6165b016eac8ec08e71b17
   loader: model.model_loader:load_qwen3_vl
   device: cuda:0
-  # false keeps all model weights on the single `device` above.
-  device_map: false
+  device_map: false # false keeps all model weights on the single `device` above.
+  vllm_gpu_utilization: 0.8 # Used with `--backend vllm`; reserve this fraction of each visible GPU.
+  max_model_len: 32768 # vLLM's KV-cache allocation for a single Colab GPU.
   dtype: bf16
 
 evaluation:
@@ -24,10 +25,9 @@ generation:
   repetition_penalty: 1.0
   presence_penalty: 1.5
   seed: 3407
-  max_new_tokens: 128 # official 32768
+  max_new_tokens: 32768 # official 32768
 
-prompt:
-  # Fixed presets are defined in model/conversation.py.
+prompt: # Fixed presets are defined in model/conversation.py.
   conversation: qwen3_vl_mmmu
 
 image:

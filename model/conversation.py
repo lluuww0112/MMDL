@@ -56,12 +56,12 @@ class Conversation:
 
 @dataclass(frozen=True)
 class MMMUConversation(Conversation):
-    """Qwen3-VL MMMU prompt template from the official evaluation script."""
+    """MMMU prompt template used by feature/soogguang's Qwen evaluation."""
 
     mmmu_template: str = (
         "{hint}Question: {question}\n"
         "Options:\n{options}\n"
-        "Answer with the option letter only."
+        "Please select the correct answer from the options above."
     )
 
     def render(self, document: Mapping[str, Any], *, fallback: str) -> str:
