@@ -22,10 +22,6 @@ def get_conversation(name: str) -> Conversation:
         raise ValueError(f"Unknown conversation {name!r}; choose one of: {supported}.") from error
 
 
-def _has_text(value: Any) -> bool:
-    return value is not None and str(value).strip() and str(value).lower() != "nan"
-
-
 def _format_options(raw_options: Any) -> str:
     if isinstance(raw_options, str):
         try:
@@ -59,7 +55,7 @@ class MMMUConversation(Conversation):
     """MMMU prompt template used by feature/soogguang's Qwen evaluation."""
 
     mmmu_template: str = (
-        "{hint}Question: {question}\n"
+        "Question: {question}\n"
         "Options:\n{options}\n"
         "Please select the correct answer from the options above."
     )
@@ -70,11 +66,9 @@ class MMMUConversation(Conversation):
         if not isinstance(question, str) or not question.strip():
             return fallback
 
-        hint = document.get("hint")
-        hint_text = f"Hint: {hint}\n" if _has_text(hint) else ""
         if not options:
-            return f"{hint_text}Question: {question}".rstrip()
-        return self.mmmu_template.format(hint=hint_text, question=question, options=options).rstrip()
+            return f"Question: {question}".rstrip()
+        return self.mmmu_template.format(question=question, options=options).rstrip()
 
 
 # Add new fixed presets here.  YAML only selects one of these names.

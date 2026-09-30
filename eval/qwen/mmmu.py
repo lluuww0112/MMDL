@@ -17,6 +17,10 @@ if str(HERE) not in sys.path:
 from custom_scoring import score_one
 
 ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from model.conversation import Conversation, get_conversation
+
 MODEL = "Qwen/Qwen3-VL-4B-Instruct"
 MODEL_REVISION = "ebb281ec70b05090aa6165b016eac8ec08e71b17"
 DATASET = "MMMU/MMMU"
@@ -37,7 +41,7 @@ def config_defaults(path: Path) -> dict:
     with path.open(encoding="utf-8") as handle:
         config = yaml.safe_load(handle) or {}
     model, evaluation = config.get("model", {}), config.get("evaluation", {})
-    generation, image = config.get("generation", {}), config.get("image", {})
+    generation, image, prompt = config.get("generation", {}), config.get("image", {}), config.get("prompt", {})
     return {
         "model_path": model.get("path", MODEL),
         "revision": model.get("revision", MODEL_REVISION),
@@ -57,6 +61,8 @@ def config_defaults(path: Path) -> dict:
         "repetition_penalty": generation.get("repetition_penalty", 1.0),
         "presence_penalty": generation.get("presence_penalty", 1.5),
         "seed": generation.get("seed", 3407),
+        "sample": generation.get("sample", "per_request"),
+        "conversation": prompt.get("conversation", "default"),
         "min_pixels": image.get("min_pixels"),
         "max_pixels": image.get("max_pixels"),
     }
@@ -92,6 +98,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repetition-penalty", type=float, default=values["repetition_penalty"])
     parser.add_argument("--presence-penalty", type=float, default=values["presence_penalty"])
     parser.add_argument("--seed", type=int, default=values["seed"])
+    parser.add_argument("--sample", choices=("global", "per_request"), default=values["sample"],
+                        help="Sampling seed mode: global uses vLLM's RNG stream; per_request fixes a seed per item.")
+    parser.add_argument("--conversation", default=values["conversation"],
+                        help="Name of the fixed prompt preset in model/conversation.py.")
     parser.add_argument("--min-pixels", type=int, default=values["min_pixels"])
     parser.add_argument("--max-pixels", type=int, default=values["max_pixels"])
     parser.add_argument("--output-path", type=Path, default=ROOT / "results" / "vllm_mmmu" / "qwen3-vl-4b-instruct_mmmu_val")
@@ -130,13 +140,24 @@ def records_for_subject(args: argparse.Namespace, subject: str) -> list[dict]:
         records.append({
             "id": str(row["id"]), "subject": subject, "question": str(row["question"]),
             "question_type": qtype, "answer": answer,
+            "options": [str(value) for value in options], "hint": row.get("hint"),
             "choices": {string.ascii_uppercase[index]: str(value) for index, value in enumerate(options)},
             "images": [row[f"image_{index}"] for index in range(1, 8) if row.get(f"image_{index}") is not None],
         })
     return records[:args.limit_per_subject] if args.limit_per_subject else records
 
 
-def input_for_record(record: dict, processor, min_pixels, max_pixels) -> dict:
+def _legacy_prompt(record: dict) -> str:
+    """Original MMMU prompt used as the fallback for generic presets."""
+
+    prompt = f"Question: {record['question']}\n"
+    if record["choices"]:
+        prompt += "Options:\n" + "".join(f"{key}. {value}\n" for key, value in record["choices"].items())
+        prompt += "Please select the correct answer from the options above."
+    return prompt.rstrip()
+
+
+def input_for_record(record: dict, processor, min_pixels, max_pixels, conversation: Conversation) -> dict:
     from qwen_vl_utils import process_vision_info
     content = []
     for image in record["images"]:
@@ -146,11 +167,11 @@ def input_for_record(record: dict, processor, min_pixels, max_pixels) -> dict:
         if max_pixels is not None:
             item["max_pixels"] = max_pixels
         content.append(item)
-    prompt = f"Question: {record['question']}\n"
-    if record["choices"]:
-        prompt += "Options:\n" + "".join(f"{key}. {value}\n" for key, value in record["choices"].items())
-        prompt += "Please select the correct answer from the options above."
-    messages = [{"role": "user", "content": [*content, {"type": "text", "text": prompt.rstrip()}]}]
+    prompt = conversation.render(record, fallback=_legacy_prompt(record))
+    messages = []
+    if conversation.system_prompt:
+        messages.append({"role": "system", "content": conversation.system_prompt})
+    messages.append({"role": "user", "content": [*content, {"type": "text", "text": prompt}]})
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     images, videos, kwargs = process_vision_info(
         messages, image_patch_size=processor.image_processor.patch_size,
@@ -188,6 +209,7 @@ def write_scores(predictions: list[dict], output_path: Path) -> tuple[Path, Path
 
 def main() -> int:
     args = parse_args()
+    conversation = get_conversation(args.conversation)
     if not args.vllm_max_model_len:
         raise ValueError("Set model.max_model_len in qwen.yaml or pass --vllm-max-model-len.")
     if not 0 < args.vllm_gpu_memory_utilization <= 1:
@@ -209,17 +231,21 @@ def main() -> int:
         limit_mm_per_prompt={"image": 7}, **extra_vllm_args(args.vllm_arg),
     )
     predictions, timing = [], {}
+    # feature/soogguang's per_request mode uses the dataset-wide index.
+    seed_index = 0
     prediction_path = output_path / "predictions.jsonl"
     total_started = time.monotonic()
     with prediction_path.open("w", encoding="utf-8") as handle:
         for subject in SUBJECTS:
             records = records_for_subject(args, subject)
-            inputs = [input_for_record(record, processor, args.min_pixels, args.max_pixels) for record in records]
+            inputs = [input_for_record(record, processor, args.min_pixels, args.max_pixels, conversation) for record in records]
             temperature = args.temperature if args.do_sample else 0.0
             params = [SamplingParams(
                 temperature=temperature, top_p=args.top_p, top_k=args.top_k,
                 repetition_penalty=args.repetition_penalty, presence_penalty=args.presence_penalty,
-                max_tokens=args.max_new_tokens, seed=args.seed * 100000 + index,
+                max_tokens=args.max_new_tokens,
+                seed=(args.seed * 100000 + seed_index + index)
+                if args.sample == "per_request" else None,
             ) for index in range(len(records))]
             started = time.monotonic()
             outputs = llm.generate(inputs, sampling_params=params)
@@ -235,6 +261,7 @@ def main() -> int:
                 predictions.append(prediction)
                 handle.write(json.dumps(prediction, ensure_ascii=False) + "\n")
             handle.flush()
+            seed_index += len(records)
             print(f"[vLLM] {subject:40s} {len(records):3d} samples {timing[subject]:7.1f}s")
     scores_path, summary_path, summary = write_scores(predictions, output_path)
     (output_path / "predictions_meta.json").write_text(json.dumps({
