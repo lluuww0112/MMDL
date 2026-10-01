@@ -7,7 +7,7 @@ model:
   loader: model.model_loader:load_qwen3_vl
   device: cuda:0
   device_map: false # false keeps all model weights on the single `device` above.
-  vllm_gpu_utilization: 0.8 # Used with `--backend vllm`; reserve this fraction of each visible GPU.
+  vllm_gpu_utilization: 0.5 # Used with `--backend vllm`; reserve this fraction of each visible GPU.
   max_model_len: 49152 # vLLM's KV-cache allocation for a single Colab GPU.
   dtype: bf16
 
