@@ -1,6 +1,6 @@
 # MMMU-val Baseline Evaluation Report — Qwen3-VL-4B-Instruct
 
-- **팀명**: 천재고양이
+- **팀명**: 행운고양이
 - **팀원**: 박수빈, 윤세혁, 우재연, 장수인
 - **작성일**: 2026-09-27
 - **재현 커맨드**: `python eval/qwen/mmmu.py --config ./config/qwen.yaml --dtype bf16 --backend vllm`
