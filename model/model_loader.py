@@ -75,6 +75,7 @@ def _resolve_torch_dtype(torch: Any, torch_dtype: str | Any | None) -> str | Any
         return torch.bfloat16 if torch.cuda.is_available() else torch.float32
     if not isinstance(torch_dtype, str):
         return torch_dtype
+    torch_dtype = {"bf16": "bfloat16", "fp16": "float16", "fp32": "float32"}.get(torch_dtype, torch_dtype)
     if torch_dtype == "auto":
         return "auto"
 

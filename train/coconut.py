@@ -26,6 +26,7 @@ except ImportError:  # Allows `python train/coconut.py ...` as well as -m.
                             LATENT_TOKEN, START_LATENT_TOKEN, load_coconut_dataset,
                             make_training_features)
 from model.model_loader import load_qwen3_vl
+from model.adapter import KRAdapter
 
 
 def _section(config: Mapping[str, Any], key: str) -> dict[str, Any]:
@@ -33,6 +34,47 @@ def _section(config: Mapping[str, Any], key: str) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise TypeError(f"config.{key} must be a mapping.")
     return dict(value)
+
+
+def _set_submodule(root: Any, path: str, replacement: torch.nn.Module) -> None:
+    """Replace the module at a dotted path, including paths through ModuleLists."""
+    parent = root
+    *parents, attribute = path.split(".")
+    for part in parents:
+        parent = parent[int(part)] if isinstance(parent, torch.nn.ModuleList) and part.isdigit() else getattr(parent, part)
+    if isinstance(parent, torch.nn.ModuleList) and attribute.isdigit():
+        parent[int(attribute)] = replacement
+    else:
+        setattr(parent, attribute, replacement)
+
+
+def _configure_kradapter(model: Any, adapter_cfg: Mapping[str, Any]) -> list[str]:
+    """Freeze the base model and replace configured Linear projections with KRAdapters."""
+    adapter_type = str(adapter_cfg.get("type", "none")).lower()
+    if adapter_type in {"", "none"}:
+        return []
+    if adapter_type != "kradapter":
+        raise ValueError(f"Unsupported adapter.type: {adapter_type!r}; expected 'kradapter' or 'none'.")
+
+    scaling = float(adapter_cfg.get("scaling", 2))
+    target_modules = adapter_cfg.get("target_modules", ("q_proj", "k_proj", "v_proj", "o_proj"))
+    if isinstance(target_modules, str):
+        target_modules = (target_modules,)
+    if not isinstance(target_modules, (list, tuple)) or not all(isinstance(name, str) and name for name in target_modules):
+        raise TypeError("config.adapter.target_modules must be a non-empty list of Linear module names.")
+
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+
+    replaced: list[str] = []
+    for name, module in tuple(model.named_modules()):
+        if isinstance(module, torch.nn.Linear) and name.rsplit(".", 1)[-1] in target_modules:
+            _set_submodule(model, name, KRAdapter(module, scaling=scaling))
+            replaced.append(name)
+    if not replaced:
+        targets = ", ".join(target_modules)
+        raise ValueError(f"KRAdapter did not find any target Linear modules: {targets}.")
+    return replaced
 
 
 def _distributed() -> tuple[int, int, torch.device]:
@@ -100,6 +142,7 @@ def _evaluate(model: Any, loader: DataLoader[Any], device: torch.device) -> floa
 
 def train(config: Mapping[str, Any], config_path: str | Path, qwen_config_path: str | Path | None = None) -> None:
     model_cfg, data_cfg, coconut_cfg, training_cfg = (_section(config, key) for key in ("model", "data", "coconut", "training"))
+    adapter_cfg = _section(config, "adapter")
     image_cfg = _section(config, "image")
     train_path = data_cfg.get("train_path")
     if not train_path:
@@ -115,6 +158,7 @@ def train(config: Mapping[str, Any], config_path: str | Path, qwen_config_path: 
     model, processor = components.model, components.processor
     tokenizer = processor.tokenizer
     tokens = _special_tokens(model, tokenizer)
+    adapter_modules = _configure_kradapter(model, adapter_cfg)
     train_set = load_coconut_dataset(
         train_path, processor, min_pixels=int(image_cfg["min_pixels"]), max_pixels=int(image_cfg["max_pixels"]),
         conversation_name=str(data_cfg.get("conversation", "qwen3_vl_mmmu")), max_samples=data_cfg.get("max_train_samples"),
@@ -125,7 +169,10 @@ def train(config: Mapping[str, Any], config_path: str | Path, qwen_config_path: 
     ) if data_cfg.get("val_path") else None
     collator = CoconutDataCollator(tokenizer.pad_token_id, tokens.latent_id)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=float(training_cfg.get("lr", 2e-5)), weight_decay=float(training_cfg.get("weight_decay", 0.01)))
+    trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    if not trainable_parameters:
+        raise ValueError("No trainable parameters remain after adapter configuration.")
+    optimizer = torch.optim.AdamW(trainable_parameters, lr=float(training_cfg.get("lr", 2e-5)), weight_decay=float(training_cfg.get("weight_decay", 0.01)))
     start_stage, start_epoch, global_step = 0, 0, 0
     if training_cfg.get("resume_from"):
         start_stage, start_epoch, global_step = _load_state(model, optimizer, training_cfg["resume_from"], device)
@@ -138,6 +185,8 @@ def train(config: Mapping[str, Any], config_path: str | Path, qwen_config_path: 
         if qwen_config_path is not None:
             shutil.copy2(qwen_config_path, run_dir / "qwen.yaml")
         print(f"Qwen image settings: min_pixels={image_cfg['min_pixels']}, max_pixels={image_cfg['max_pixels']}", flush=True)
+        if adapter_modules:
+            print(f"KRAdapter applied to {len(adapter_modules)} Linear layers: {', '.join(adapter_modules)}", flush=True)
     if dist.is_initialized():
         dist.barrier()
 

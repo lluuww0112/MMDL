@@ -7,9 +7,14 @@ seed: 42
 
 model:
   path: Qwen/Qwen3-VL-4B-Instruct
-  revision: null
-  dtype: bfloat16
+  revision: ebb281ec70b05090aa6165b016eac8ec08e71b17
+  dtype: bf16
   attn_implementation: sdpa
+
+adapter:
+  type: kradapter
+  scaling: 2 # Official KRAdapter default; internal dimensions are inferred from each base Linear layer.
+  target_modules: [q_proj, k_proj, v_proj, o_proj]
 
 data:
   train_path: null # Required before training.
