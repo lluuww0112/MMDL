@@ -60,13 +60,14 @@ def resolve_model_source(model_source: str | Path | None = None) -> str:
 def _import_runtime() -> tuple[Any, Any, Any]:
     try:
         import torch
-        from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+        from transformers import AutoProcessor
+        from .qwen_arch import CoconutQwen3VLForConditionalGeneration
     except ImportError as error:
         raise RuntimeError(
             "Loading Qwen3-VL requires compatible torch and transformers packages. "
             "Install the versions listed in requirements.txt."
         ) from error
-    return torch, AutoProcessor, Qwen3VLForConditionalGeneration
+    return torch, AutoProcessor, CoconutQwen3VLForConditionalGeneration
 
 
 def _resolve_torch_dtype(torch: Any, torch_dtype: str | Any | None) -> str | Any:

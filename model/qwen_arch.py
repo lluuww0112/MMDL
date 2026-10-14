@@ -241,3 +241,116 @@ class Qwen3VLArchitecture:
 
         model_inputs.pop("token_type_ids", None)
         return self.model(**model_inputs)
+
+
+# COCONUT uses a native Qwen3-VL subclass so checkpoints retain the ordinary
+# Transformers model layout while the forward pass gains continuous thoughts.
+import torch
+from transformers import Qwen3VLForConditionalGeneration
+
+
+@dataclass
+class CoconutQwen3VLOutput:
+    loss: Any | None
+    logits: Any
+    past_key_values: Any | None = None
+    inputs_embeds: Any | None = None
+
+
+class CoconutQwen3VLForConditionalGeneration(Qwen3VLForConditionalGeneration):
+    """Qwen3-VL model whose latent tokens feed back preceding hidden states."""
+
+    latent_token_id: int | None = None
+    start_latent_id: int | None = None
+    end_latent_id: int | None = None
+
+    def configure_coconut(self, *, latent_token_id: int, start_latent_id: int, end_latent_id: int) -> None:
+        self.latent_token_id = int(latent_token_id)
+        self.start_latent_id = int(start_latent_id)
+        self.end_latent_id = int(end_latent_id)
+
+    def _forward_segment(self, embeds: Any, attention_mask: Any, position_ids: Any,
+                         cache: Any | None, extra: Mapping[str, Any]) -> Any:
+        return super().forward(inputs_embeds=embeds, attention_mask=attention_mask,
+                               position_ids=position_ids, past_key_values=cache,
+                               use_cache=True, output_hidden_states=True,
+                               return_dict=True, **extra)
+
+    def forward(self, input_ids: Any | None = None, attention_mask: Any | None = None,
+                position_ids: Any | None = None, labels: Any | None = None,
+                **kwargs: Any) -> CoconutQwen3VLOutput:
+        """Run COCONUT's sequential latent feedback with Qwen's KV cache."""
+        import torch
+        from torch.nn import CrossEntropyLoss
+
+        if input_ids is None:
+            raise ValueError("COCONUT Qwen requires input_ids.")
+        if self.latent_token_id is None:
+            raise RuntimeError("Call configure_coconut() after adding special tokens.")
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+        if position_ids is None:
+            position_ids = torch.arange(input_ids.shape[1], device=input_ids.device).unsqueeze(0).expand_as(input_ids)
+        locations = (input_ids == self.latent_token_id).nonzero(as_tuple=False)
+        if locations.numel() == 0:
+            output = super().forward(input_ids=input_ids, attention_mask=attention_mask,
+                                     position_ids=position_ids, labels=labels, return_dict=True, **kwargs)
+            return CoconutQwen3VLOutput(output.loss, output.logits, getattr(output, "past_key_values", None))
+
+        latent_rows = [[int(pos) for row, pos in locations.tolist() if row == batch]
+                       for batch in range(input_ids.shape[0])]
+        maximum = max(len(row) for row in latent_rows)
+        first = min(int(pos) for _, pos in locations.tolist())
+        if first == 0:
+            raise ValueError("A latent token cannot be the first sequence token.")
+        embeds = self.get_input_embeddings()(input_ids)
+        # Vision tensors are consumed only in the initial prompt segment.
+        initial_extra = dict(kwargs)
+        cache_extra = {key: value for key, value in kwargs.items()
+                       if key not in {"pixel_values", "pixel_values_videos", "image_grid_thw", "video_grid_thw"}}
+        cache, chunks, start = None, [], 0
+        for index in range(maximum):
+            end = first + index
+            output = self._forward_segment(embeds[:, start:end, :], attention_mask[:, :end],
+                                           position_ids[:, start:end], cache,
+                                           initial_extra if cache is None else cache_extra)
+            chunks.append(output.logits)
+            cache = output.past_key_values
+            updated = embeds.clone()
+            for batch, row in enumerate(latent_rows):
+                if index < len(row):
+                    position = row[index]
+                    if position != end:
+                        raise ValueError("Latents must be contiguous and aligned by CoconutDataCollator.")
+                    updated[batch, position, :] = output.hidden_states[-1][batch, -1, :]
+            embeds, start = updated, end
+
+        output = self._forward_segment(embeds[:, start:, :], attention_mask, position_ids[:, start:], cache, cache_extra)
+        chunks.append(output.logits)
+        logits = torch.cat(chunks, dim=1)
+        loss = None
+        if labels is not None:
+            loss = CrossEntropyLoss(ignore_index=-100)(logits[:, :-1, :].reshape(-1, logits.shape[-1]), labels[:, 1:].reshape(-1))
+        return CoconutQwen3VLOutput(loss, logits, output.past_key_values, embeds)
+
+    @torch.no_grad()
+    def generate(self, input_ids: Any, attention_mask: Any | None = None, max_new_tokens: int = 128,
+                 **kwargs: Any) -> Any:
+        """Greedy generation retaining continuous-thought feedback (batch size 1)."""
+        import torch
+        if input_ids.shape[0] != 1:
+            raise ValueError("COCONUT generation currently supports batch_size=1.")
+        if kwargs.pop("do_sample", False):
+            raise NotImplementedError("Sampling is not implemented for COCONUT generation.")
+        generated = input_ids
+        output = self.forward(input_ids=generated, attention_mask=attention_mask, **kwargs)
+        embeds = output.inputs_embeds
+        for _ in range(max_new_tokens):
+            next_token = output.logits[:, -1].argmax(dim=-1, keepdim=True)
+            generated = torch.cat([generated, next_token], dim=1)
+            if int(next_token.item()) == self.config.eos_token_id:
+                break
+            embeds = torch.cat([embeds, self.get_input_embeddings()(next_token)], dim=1)
+            base = super().forward(inputs_embeds=embeds, return_dict=True)
+            output = CoconutQwen3VLOutput(None, base.logits, getattr(base, "past_key_values", None), embeds)
+        return generated
