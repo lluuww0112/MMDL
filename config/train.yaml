@@ -1,8 +1,10 @@
 # Single-image COCONUT sample format:
 # [{"image": "relative/path.jpg", "question": str, "answer": str, "steps": [str, ...]}]
 # min_pixels/max_pixels are read from the qwen.yaml argument to train/run.sh.
-run_name: qwen3-vl-coconut
 history_dir: ./history
+history:
+  load_checkpoint: null # Checkpoint file or previous run directory, relative to history_dir.
+  save_name: qwen3-vl-coconut-kradapter # New run directory under history_dir.
 seed: 42
 
 model:
@@ -29,9 +31,6 @@ coconut:
   max_latent_stage: 4
   epochs_per_stage: 1
   pad_latent_to_max: false
-  uniform_prob: 0.0
-  no_special_markers: false
-  no_cot: false
 
 training:
   optimizer: adamw
@@ -42,4 +41,3 @@ training:
   max_grad_norm: 1.0
   num_workers: 0
   save_every_epochs: 1
-  resume_from: null

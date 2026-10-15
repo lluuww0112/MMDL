@@ -36,6 +36,24 @@ def _section(config: Mapping[str, Any], key: str) -> dict[str, Any]:
     return dict(value)
 
 
+def _resolve_checkpoint_path(history_dir: str | Path, checkpoint: str) -> Path:
+    """Resolve an explicit checkpoint path or a previous history run directory."""
+    path = Path(checkpoint).expanduser()
+    if not path.is_absolute():
+        path = Path(history_dir) / path
+    if path.is_dir():
+        best = path / "best.pt"
+        if best.is_file():
+            return best
+        checkpoints = sorted(path.glob("checkpoint_stage*_epoch*.pt"))
+        if checkpoints:
+            return checkpoints[-1]
+        raise FileNotFoundError(f"No checkpoint files found in history run: {path}")
+    if not path.is_file():
+        raise FileNotFoundError(f"Checkpoint not found: {path}")
+    return path
+
+
 def _set_submodule(root: Any, path: str, replacement: torch.nn.Module) -> None:
     """Replace the module at a dotted path, including paths through ModuleLists."""
     parent = root
@@ -116,6 +134,34 @@ def _special_tokens(model: Any, tokenizer: Any) -> CoconutSpecialTokens:
     return ids
 
 
+def _enable_special_token_embeddings(model: Any, tokens: CoconutSpecialTokens) -> torch.nn.Parameter:
+    """Train only COCONUT's start/end latent-marker embedding rows.
+
+    PyTorch exposes ``requires_grad`` per parameter, rather than per embedding
+    row. We therefore unfreeze the embedding matrix and mask its gradients so
+    only the two marker rows can change. ``<|latent|>`` is a positional
+    placeholder whose embedding is replaced by a hidden state before use, so
+    its learned input vector is unnecessary. The caller must put this parameter
+    in an optimizer group with no weight decay; otherwise AdamW would still
+    modify every frozen row through decoupled weight decay.
+    """
+    embedding = model.get_input_embeddings()
+    weight = getattr(embedding, "weight", None)
+    if not isinstance(weight, torch.nn.Parameter) or weight.ndim != 2:
+        raise TypeError("The model input embedding must expose a rank-2 weight Parameter.")
+    token_ids = (tokens.start_id, tokens.end_id)
+    if any(token_id < 0 or token_id >= weight.shape[0] for token_id in token_ids):
+        raise ValueError("COCONUT special-token IDs are outside the input embedding table.")
+
+    allowed_rows = torch.zeros(weight.shape[0], device=weight.device, dtype=weight.dtype)
+    allowed_rows[list(token_ids)] = 1
+    weight.requires_grad_(True)
+    weight.register_hook(
+        lambda gradient: gradient * allowed_rows.to(device=gradient.device, dtype=gradient.dtype).unsqueeze(1)
+    )
+    return weight
+
+
 def _load_state(model: Any, optimizer: Any, path: str, device: torch.device) -> tuple[int, int, int]:
     checkpoint = CheckpointManager.load(path, map_location=device)
     state = checkpoint["model_state"]
@@ -143,7 +189,15 @@ def _evaluate(model: Any, loader: DataLoader[Any], device: torch.device) -> floa
 def train(config: Mapping[str, Any], config_path: str | Path, qwen_config_path: str | Path | None = None) -> None:
     model_cfg, data_cfg, coconut_cfg, training_cfg = (_section(config, key) for key in ("model", "data", "coconut", "training"))
     adapter_cfg = _section(config, "adapter")
+    history_cfg = _section(config, "history")
     image_cfg = _section(config, "image")
+    history_dir = config.get("history_dir", "./history")
+    save_name = history_cfg.get("save_name", config.get("run_name", "qwen3-vl-coconut"))
+    if not isinstance(save_name, str) or not save_name.strip():
+        raise TypeError("config.history.save_name must be a non-empty string.")
+    load_checkpoint = history_cfg.get("load_checkpoint") or training_cfg.get("resume_from")
+    if load_checkpoint is not None and (not isinstance(load_checkpoint, str) or not load_checkpoint.strip()):
+        raise TypeError("config.history.load_checkpoint must be a non-empty checkpoint path or run name when set.")
     train_path = data_cfg.get("train_path")
     if not train_path:
         raise ValueError("config.data.train_path is required; it must point to official COCONUT JSON data.")
@@ -159,6 +213,7 @@ def train(config: Mapping[str, Any], config_path: str | Path, qwen_config_path: 
     tokenizer = processor.tokenizer
     tokens = _special_tokens(model, tokenizer)
     adapter_modules = _configure_kradapter(model, adapter_cfg)
+    special_embedding_parameter = _enable_special_token_embeddings(model, tokens) if adapter_modules else None
     train_set = load_coconut_dataset(
         train_path, processor, min_pixels=int(image_cfg["min_pixels"]), max_pixels=int(image_cfg["max_pixels"]),
         conversation_name=str(data_cfg.get("conversation", "qwen3_vl_mmmu")), max_samples=data_cfg.get("max_train_samples"),
@@ -169,24 +224,37 @@ def train(config: Mapping[str, Any], config_path: str | Path, qwen_config_path: 
     ) if data_cfg.get("val_path") else None
     collator = CoconutDataCollator(tokenizer.pad_token_id, tokens.latent_id)
 
-    trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    trainable_parameters = [parameter for parameter in model.parameters()
+                            if parameter.requires_grad and parameter is not special_embedding_parameter]
     if not trainable_parameters:
         raise ValueError("No trainable parameters remain after adapter configuration.")
-    optimizer = torch.optim.AdamW(trainable_parameters, lr=float(training_cfg.get("lr", 2e-5)), weight_decay=float(training_cfg.get("weight_decay", 0.01)))
+    optimizer_groups: list[dict[str, Any]] = [{"params": trainable_parameters}]
+    if special_embedding_parameter is not None:
+        # A zero gradient alone does not freeze AdamW rows because its decoupled
+        # weight decay updates them. Keep this whole matrix decay-free.
+        optimizer_groups.append({"params": [special_embedding_parameter], "weight_decay": 0.0})
+    optimizer = torch.optim.AdamW(optimizer_groups, lr=float(training_cfg.get("lr", 2e-5)),
+                                  weight_decay=float(training_cfg.get("weight_decay", 0.01)))
     start_stage, start_epoch, global_step = 0, 0, 0
-    if training_cfg.get("resume_from"):
-        start_stage, start_epoch, global_step = _load_state(model, optimizer, training_cfg["resume_from"], device)
+    resume_path: Path | None = None
+    if load_checkpoint:
+        resume_path = _resolve_checkpoint_path(history_dir, load_checkpoint)
+        start_stage, start_epoch, global_step = _load_state(model, optimizer, str(resume_path), device)
     if world_size > 1:
         model = DistributedDataParallel(model, device_ids=[device.index] if device.type == "cuda" else None)
 
-    manager = CheckpointManager(config.get("history_dir", "./history"), config.get("run_name", "qwen3-vl-coconut"), config_path, config)
+    manager = CheckpointManager(history_dir, save_name, config_path, config)
     if rank == 0:
         run_dir = manager.prepare()
         if qwen_config_path is not None:
             shutil.copy2(qwen_config_path, run_dir / "qwen.yaml")
         print(f"Qwen image settings: min_pixels={image_cfg['min_pixels']}, max_pixels={image_cfg['max_pixels']}", flush=True)
+        print(f"Checkpoint output run: {run_dir}", flush=True)
+        if resume_path is not None:
+            print(f"Resumed from checkpoint: {resume_path}", flush=True)
         if adapter_modules:
             print(f"KRAdapter applied to {len(adapter_modules)} Linear layers: {', '.join(adapter_modules)}", flush=True)
+            print("Only <|start-latent|> and <|end-latent|> input-embedding rows are trainable.", flush=True)
     if dist.is_initialized():
         dist.barrier()
 
@@ -253,11 +321,20 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train Qwen3-VL with COCONUT continuous thoughts.")
     parser.add_argument("--config", default="config/train.yaml", help="Path to a COCONUT YAML configuration.")
     parser.add_argument("--qwen-config", default="config/qwen.yaml", help="MMMU Qwen YAML supplying single-image bounds.")
+    parser.add_argument("--load-checkpoint", help="Checkpoint file or history run directory to resume from.")
+    parser.add_argument("--save-name", help="New history run name used for checkpoints written by this training run.")
     args = parser.parse_args()
     with Path(args.config).open(encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
     if not isinstance(config, Mapping):
         raise ValueError("The training config must be a YAML mapping.")
+    config = dict(config)
+    history = _section(config, "history")
+    if args.load_checkpoint is not None:
+        history["load_checkpoint"] = args.load_checkpoint
+    if args.save_name is not None:
+        history["save_name"] = args.save_name
+    config["history"] = history
     train(inject_qwen_image_settings(config, args.qwen_config), args.config, args.qwen_config)
 
 

@@ -6,6 +6,8 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TRAIN_CONFIG_PATH="${REPO_ROOT}/config/train.yaml"
 MODEL_CONFIG_PATH="${REPO_ROOT}/config/qwen.yaml"
 DEVICE=""
+LOAD_CHECKPOINT=""
+SAVE_NAME=""
 NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
 
 usage() {
@@ -16,6 +18,8 @@ Options:
   --train-config PATH  COCONUT training YAML (default: config/train.yaml)
   --model-config PATH  Qwen/MMMU model YAML (default: config/qwen.yaml)
   --device DEVICE      cuda, cuda:N, or cpu (default: preserve environment)
+  --load-checkpoint X  Checkpoint file or history run directory to resume from
+  --save-name NAME     New history run name for checkpoints written by this run
   -h, --help           Show this message
 EOF
 }
@@ -31,6 +35,12 @@ while [[ $# -gt 0 ]]; do
     --device)
       [[ $# -ge 2 ]] || { echo "--device requires cuda, cuda:N, or cpu" >&2; exit 2; }
       DEVICE="$2"; shift 2 ;;
+    --load-checkpoint)
+      [[ $# -ge 2 ]] || { echo "--load-checkpoint requires a checkpoint path or run name" >&2; exit 2; }
+      LOAD_CHECKPOINT="$2"; shift 2 ;;
+    --save-name)
+      [[ $# -ge 2 ]] || { echo "--save-name requires a run name" >&2; exit 2; }
+      SAVE_NAME="$2"; shift 2 ;;
     -h|--help)
       usage; exit 0 ;;
     *)
@@ -62,5 +72,12 @@ case "${DEVICE}" in
 esac
 
 cd "${REPO_ROOT}"
+TRAIN_ARGS=(--config "${TRAIN_CONFIG_PATH}" --qwen-config "${MODEL_CONFIG_PATH}")
+if [[ -n "${LOAD_CHECKPOINT}" ]]; then
+  TRAIN_ARGS+=(--load-checkpoint "${LOAD_CHECKPOINT}")
+fi
+if [[ -n "${SAVE_NAME}" ]]; then
+  TRAIN_ARGS+=(--save-name "${SAVE_NAME}")
+fi
 exec torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" \
-  -m train.coconut --config "${TRAIN_CONFIG_PATH}" --qwen-config "${MODEL_CONFIG_PATH}"
+  -m train.coconut "${TRAIN_ARGS[@]}"

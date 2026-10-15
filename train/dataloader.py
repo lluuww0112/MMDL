@@ -136,15 +136,13 @@ def make_training_features(dataset: Iterable[TokenizedExample], *, stage: int, c
     if stage < 0:
         raise ValueError("stage must be non-negative.")
     c_thought, max_stage = int(_value(config, "c_thought", 1)), int(_value(config, "max_latent_stage", stage))
-    uniform_prob = float(_value(config, "uniform_prob", 0.0))
-    if c_thought < 0 or max_stage < 0 or not 0 <= uniform_prob <= 1:
+    if c_thought < 0 or max_stage < 0:
         raise ValueError("Invalid COCONUT curriculum values.")
     rng, output = random.Random(seed), []
-    markers = not bool(_value(config, "no_special_markers", False))
     for item in dataset:
-        selected = rng.randrange(len(item.steps) + 1) if rng.random() < uniform_prob else stage
-        skipped = len(item.steps) if bool(_value(config, "no_cot", False)) or selected > max_stage else min(selected, len(item.steps), max_stage)
-        prefix = list(item.question) + ([tokens.start_id] if markers else []) + [tokens.latent_id] * (skipped * c_thought) + ([tokens.end_id] if markers else [])
+        selected = stage
+        skipped = len(item.steps) if selected > max_stage else min(selected, len(item.steps), max_stage)
+        prefix = list(item.question) + [tokens.start_id] + [tokens.latent_id] * (skipped * c_thought) + [tokens.end_id]
         target = [token for step in item.steps[skipped:] for token in step] + list(item.answer)
         ids = prefix + target
         output.append({"input_ids": ids, "labels": [IGNORE_INDEX] * len(prefix) + target,
@@ -158,10 +156,10 @@ def make_training_features(dataset: Iterable[TokenizedExample], *, stage: int, c
 def make_generation_features(dataset: Iterable[TokenizedExample], *, stage: int, config: Mapping[str, Any] | Any,
                              tokens: CoconutSpecialTokens) -> list[dict[str, Any]]:
     c_thought, max_stage = int(_value(config, "c_thought", 1)), int(_value(config, "max_latent_stage", stage))
-    markers, output = not bool(_value(config, "no_special_markers", False)), []
+    output = []
     for item in dataset:
         count = max_stage if bool(_value(config, "pad_latent_to_max", False)) else min(stage, max_stage, len(item.steps))
-        ids = list(item.question) + ([tokens.start_id] if markers else []) + [tokens.latent_id] * (count * c_thought) + ([tokens.end_id] if markers else [])
+        ids = list(item.question) + [tokens.start_id] + [tokens.latent_id] * (count * c_thought) + [tokens.end_id]
         output.append({"input_ids": ids, "attention_mask": [1] * len(ids), "position_ids": list(range(len(ids))),
                        "vision_inputs": item.vision_inputs, "idx": item.index})
     return output
