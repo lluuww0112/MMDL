@@ -3,6 +3,8 @@
 # min_pixels/max_pixels are read from the qwen.yaml argument to train/run.sh.
 history_dir: ./history
 history:
+  # null starts and completes stage 0 only.  Loading a previous run directory
+  # automatically resumes its incomplete stage or trains the next completed stage.
   load_checkpoint: null # Checkpoint file or previous run directory, relative to history_dir.
   save_name: qwen3-vl-coconut-kradapter # New run directory under history_dir.
 seed: 42

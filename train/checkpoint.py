@@ -42,6 +42,19 @@ class CheckpointManager:
             metadata.write_text(json.dumps({"created_at": datetime.now(timezone.utc).isoformat()}, indent=2) + "\n", encoding="utf-8")
         return self.run_dir
 
+    def _update_metadata(self, **updates: Any) -> None:
+        """Atomically preserve run metadata while recording training progress."""
+        self.prepare()
+        path = self.run_dir / "metadata.json"
+        with path.open(encoding="utf-8") as handle:
+            metadata = json.load(handle)
+        if not isinstance(metadata, dict):
+            raise ValueError(f"Checkpoint metadata must be a JSON object: {path}")
+        metadata.update(updates)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(path)
+
     def path_for(self, stage: int, epoch: int) -> Path:
         return self.run_dir / f"checkpoint_stage{stage:02d}_epoch{epoch:04d}.pt"
 
@@ -60,9 +73,24 @@ class CheckpointManager:
         output, temporary = self.path_for(stage, epoch), self.path_for(stage, epoch).with_suffix(".tmp")
         _torch().save(payload, temporary)
         temporary.replace(output)
+        self._update_metadata(
+            latest_checkpoint=output.name,
+            latest_checkpoint_stage=stage,
+            latest_checkpoint_epoch=epoch,
+            global_step=global_step,
+        )
         if is_best:
             shutil.copy2(output, self.run_dir / "best.pt")
         return output
+
+    def mark_stage_completed(self, *, stage: int, epoch: int, global_step: int) -> None:
+        """Record that every epoch of a COCONUT stage finished successfully."""
+        self._update_metadata(
+            last_completed_stage=stage,
+            last_completed_epoch=epoch,
+            last_completed_checkpoint=self.path_for(stage, epoch).name,
+            global_step=global_step,
+        )
 
     @staticmethod
     def load(path: str | Path, *, map_location: Any = "cpu") -> dict[str, Any]:

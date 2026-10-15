@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import random
 import shutil
@@ -42,12 +43,19 @@ def _resolve_checkpoint_path(history_dir: str | Path, checkpoint: str) -> Path:
     if not path.is_absolute():
         path = Path(history_dir) / path
     if path.is_dir():
-        best = path / "best.pt"
-        if best.is_file():
-            return best
+        metadata_path = path / "metadata.json"
+        if metadata_path.is_file():
+            with metadata_path.open(encoding="utf-8") as handle:
+                metadata = json.load(handle)
+            latest = metadata.get("latest_checkpoint") if isinstance(metadata, Mapping) else None
+            if isinstance(latest, str) and (path / latest).is_file():
+                return path / latest
         checkpoints = sorted(path.glob("checkpoint_stage*_epoch*.pt"))
         if checkpoints:
             return checkpoints[-1]
+        best = path / "best.pt"
+        if best.is_file():
+            return best
         raise FileNotFoundError(f"No checkpoint files found in history run: {path}")
     if not path.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {path}")
@@ -174,6 +182,31 @@ def _load_state(model: Any, optimizer: Any, path: str, device: torch.device) -> 
     return int(progress.get("stage", 0)), int(progress.get("epoch", -1)) + 1, int(progress.get("global_step", 0))
 
 
+def _last_completed_stage(checkpoint_path: str | Path) -> int | None:
+    """Read the completed-stage marker written beside a project checkpoint."""
+    metadata_path = Path(checkpoint_path).parent / "metadata.json"
+    if not metadata_path.is_file():
+        return None
+    with metadata_path.open(encoding="utf-8") as handle:
+        metadata = json.load(handle)
+    if not isinstance(metadata, Mapping):
+        raise ValueError(f"Checkpoint metadata must be a JSON object: {metadata_path}")
+    # A history directory resolves to ``latest_checkpoint``.  It may contain a
+    # partially completed next stage, so use the last completed marker in that
+    # case.  For an explicitly selected older/best checkpoint, fall back to
+    # the checkpoint's own training state instead of pairing it with unrelated
+    # run-level metadata.
+    known_checkpoints = {metadata.get("latest_checkpoint"), metadata.get("last_completed_checkpoint")}
+    if checkpoint_path.name not in known_checkpoints:
+        return None
+    stage = metadata.get("last_completed_stage")
+    if stage is None:
+        return None
+    if isinstance(stage, bool) or not isinstance(stage, int) or stage < 0:
+        raise ValueError(f"Checkpoint metadata has invalid last_completed_stage: {stage!r}")
+    return stage
+
+
 def _evaluate(model: Any, loader: DataLoader[Any], device: torch.device) -> float:
     model.eval()
     losses: list[float] = []
@@ -235,11 +268,24 @@ def train(config: Mapping[str, Any], config_path: str | Path, qwen_config_path: 
         optimizer_groups.append({"params": [special_embedding_parameter], "weight_decay": 0.0})
     optimizer = torch.optim.AdamW(optimizer_groups, lr=float(training_cfg.get("lr", 2e-5)),
                                   weight_decay=float(training_cfg.get("weight_decay", 0.01)))
-    start_stage, start_epoch, global_step = 0, 0, 0
+    checkpoint_stage, checkpoint_epoch, global_step = 0, 0, 0
     resume_path: Path | None = None
     if load_checkpoint:
         resume_path = _resolve_checkpoint_path(history_dir, load_checkpoint)
-        start_stage, start_epoch, global_step = _load_state(model, optimizer, str(resume_path), device)
+        checkpoint_stage, checkpoint_epoch, global_step = _load_state(model, optimizer, str(resume_path), device)
+    completed_stage = _last_completed_stage(resume_path) if resume_path is not None else None
+    # New runs begin at stage 0.  A completed checkpoint advances exactly one
+    # stage; if interrupted mid-stage, its metadata remains unchanged and the
+    # latest checkpoint resumes that same stage.
+    stage = (completed_stage + 1) if completed_stage is not None else (checkpoint_stage if resume_path is not None else 0)
+    max_stage = int(coconut_cfg.get("max_latent_stage", 0))
+    if stage > max_stage:
+        if rank == 0:
+            print(f"All COCONUT stages through {max_stage} are already complete; nothing to train.", flush=True)
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        return
+    start_epoch = checkpoint_epoch if resume_path is not None and stage == checkpoint_stage else 0
     if world_size > 1:
         model = DistributedDataParallel(model, device_ids=[device.index] if device.type == "cuda" else None)
 
@@ -252,6 +298,7 @@ def train(config: Mapping[str, Any], config_path: str | Path, qwen_config_path: 
         print(f"Checkpoint output run: {run_dir}", flush=True)
         if resume_path is not None:
             print(f"Resumed from checkpoint: {resume_path}", flush=True)
+        print(f"Training COCONUT stage {stage}", flush=True)
         if adapter_modules:
             print(f"KRAdapter applied to {len(adapter_modules)} Linear layers: {', '.join(adapter_modules)}", flush=True)
             print("Only <|start-latent|> and <|end-latent|> input-embedding rows are trainable.", flush=True)
@@ -262,40 +309,47 @@ def train(config: Mapping[str, Any], config_path: str | Path, qwen_config_path: 
     accumulation = int(training_cfg.get("gradient_accumulation_steps", 1))
     if accumulation <= 0:
         raise ValueError("gradient_accumulation_steps must be positive.")
+    epochs_per_stage = int(coconut_cfg.get("epochs_per_stage", 1))
+    if epochs_per_stage <= 0:
+        raise ValueError("config.coconut.epochs_per_stage must be positive.")
     best_loss = float("inf")
-    for stage in range(start_stage, int(coconut_cfg.get("max_latent_stage", 0)) + 1):
-        for epoch in range(start_epoch if stage == start_stage else 0, int(coconut_cfg.get("epochs_per_stage", 1))):
-            features = make_training_features(train_set, stage=stage, config=coconut_cfg,
-                                              tokens=tokens, seed=int(config.get("seed", 42)) + epoch, shuffle=True)
-            sampler = DistributedSampler(features, num_replicas=world_size, rank=rank, shuffle=True) if world_size > 1 else None
-            loader = DataLoader(features, batch_size=batch_size, shuffle=sampler is None, sampler=sampler,
-                                num_workers=int(training_cfg.get("num_workers", 0)), collate_fn=collator)
-            if sampler is not None:
-                sampler.set_epoch(stage * 100000 + epoch)
-            model.train()
-            optimizer.zero_grad(set_to_none=True)
-            for step, batch in enumerate(loader):
-                batch.pop("idx", None)
-                result = model(**{key: value.to(device) for key, value in batch.items()})
-                (result.loss / accumulation).backward()
-                if (step + 1) % accumulation == 0 or step + 1 == len(loader):
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), float(training_cfg.get("max_grad_norm", 1.0)))
-                    optimizer.step()
-                    optimizer.zero_grad(set_to_none=True)
-                    global_step += 1
-            metrics: dict[str, float] = {}
-            if val_set is not None and rank == 0:
-                val_features = make_training_features(val_set, stage=stage, config=coconut_cfg, tokens=tokens)
-                metrics["val_loss"] = _evaluate(model.module if hasattr(model, "module") else model,
-                                                  DataLoader(val_features, batch_size=batch_size, collate_fn=collator), device)
-            score = metrics.get("val_loss", float("inf"))
-            if rank == 0:
-                saved = manager.save(model=model, optimizer=optimizer, stage=stage, epoch=epoch,
-                                     global_step=global_step, metrics=metrics, is_best=score <= best_loss)
-                print(f"saved {saved} {metrics}", flush=True)
-            best_loss = min(best_loss, score)
-            if dist.is_initialized():
-                dist.barrier()
+    for epoch in range(start_epoch, epochs_per_stage):
+        features = make_training_features(train_set, stage=stage, config=coconut_cfg,
+                                          tokens=tokens, seed=int(config.get("seed", 42)) + epoch, shuffle=True)
+        sampler = DistributedSampler(features, num_replicas=world_size, rank=rank, shuffle=True) if world_size > 1 else None
+        loader = DataLoader(features, batch_size=batch_size, shuffle=sampler is None, sampler=sampler,
+                            num_workers=int(training_cfg.get("num_workers", 0)), collate_fn=collator)
+        if sampler is not None:
+            sampler.set_epoch(stage * 100000 + epoch)
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
+        for step, batch in enumerate(loader):
+            batch.pop("idx", None)
+            result = model(**{key: value.to(device) for key, value in batch.items()})
+            (result.loss / accumulation).backward()
+            if (step + 1) % accumulation == 0 or step + 1 == len(loader):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), float(training_cfg.get("max_grad_norm", 1.0)))
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                global_step += 1
+        metrics: dict[str, float] = {}
+        if val_set is not None and rank == 0:
+            val_features = make_training_features(val_set, stage=stage, config=coconut_cfg, tokens=tokens)
+            metrics["val_loss"] = _evaluate(model.module if hasattr(model, "module") else model,
+                                              DataLoader(val_features, batch_size=batch_size, collate_fn=collator), device)
+        score = metrics.get("val_loss", float("inf"))
+        if rank == 0:
+            saved = manager.save(model=model, optimizer=optimizer, stage=stage, epoch=epoch,
+                                 global_step=global_step, metrics=metrics, is_best=score <= best_loss)
+            print(f"saved {saved} {metrics}", flush=True)
+        best_loss = min(best_loss, score)
+        if dist.is_initialized():
+            dist.barrier()
+    if rank == 0:
+        manager.mark_stage_completed(stage=stage, epoch=epochs_per_stage - 1, global_step=global_step)
+        print(f"completed COCONUT stage {stage}", flush=True)
+    if dist.is_initialized():
+        dist.barrier()
     if dist.is_initialized():
         dist.destroy_process_group()
 
