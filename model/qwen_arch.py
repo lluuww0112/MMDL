@@ -257,6 +257,51 @@ class CoconutQwen3VLOutput:
     inputs_embeds: Any | None = None
 
 
+@dataclass(frozen=True)
+class CoconutLatentLayout:
+    """Validated positions of COCONUT latent tokens in a batched prompt.
+
+    Both the Transformers training model and the vLLM model plugin must split
+    a prefill immediately before every latent token, then replace that token's
+    embedding with the previous segment's final hidden state.  Keeping this
+    validation independent of either runtime prevents the two implementations
+    from silently using different COCONUT prompt layouts.
+    """
+
+    rows: tuple[tuple[int, ...], ...]
+    first: int
+    count: int
+
+
+def coconut_latent_layout(input_ids: Any, latent_token_id: int) -> CoconutLatentLayout | None:
+    """Validate and return the aligned contiguous latent-token layout.
+
+    ``None`` means that the prompt has no latent tokens, so callers can take
+    the ordinary Qwen forward path.  Every non-empty row must contain latents
+    at the same positions; this is the contract enforced by
+    ``CoconutDataCollator`` and required for a batched latent prefill.
+    """
+    if getattr(input_ids, "ndim", None) != 2:
+        raise ValueError("COCONUT latent layout requires rank-2 input_ids.")
+    locations = (input_ids == latent_token_id).nonzero(as_tuple=False)
+    if locations.numel() == 0:
+        return None
+    rows = tuple(
+        tuple(int(position) for row, position in locations.tolist() if row == batch)
+        for batch in range(input_ids.shape[0])
+    )
+    if not all(rows):
+        raise ValueError("COCONUT latent tokens must occur in every batch row.")
+    reference = rows[0]
+    if reference[0] == 0:
+        raise ValueError("A COCONUT latent token cannot be the first sequence token.")
+    if tuple(range(reference[0], reference[0] + len(reference))) != reference:
+        raise ValueError("COCONUT latent tokens must be contiguous.")
+    if any(row != reference for row in rows[1:]):
+        raise ValueError("COCONUT latent tokens must be aligned across batch rows.")
+    return CoconutLatentLayout(rows=rows, first=reference[0], count=len(reference))
+
+
 class CoconutQwen3VLForConditionalGeneration(Qwen3VLForConditionalGeneration):
     """Qwen3-VL model whose latent tokens feed back preceding hidden states."""
 
@@ -291,38 +336,27 @@ class CoconutQwen3VLForConditionalGeneration(Qwen3VLForConditionalGeneration):
             attention_mask = torch.ones_like(input_ids)
         if position_ids is None:
             position_ids = torch.arange(input_ids.shape[1], device=input_ids.device).unsqueeze(0).expand_as(input_ids)
-        locations = (input_ids == self.latent_token_id).nonzero(as_tuple=False)
-        if locations.numel() == 0:
+        layout = coconut_latent_layout(input_ids, self.latent_token_id)
+        if layout is None:
             output = super().forward(input_ids=input_ids, attention_mask=attention_mask,
                                      position_ids=position_ids, labels=labels, return_dict=True, **kwargs)
             return CoconutQwen3VLOutput(output.loss, output.logits, getattr(output, "past_key_values", None))
-
-        latent_rows = [[int(pos) for row, pos in locations.tolist() if row == batch]
-                       for batch in range(input_ids.shape[0])]
-        maximum = max(len(row) for row in latent_rows)
-        first = min(int(pos) for _, pos in locations.tolist())
-        if first == 0:
-            raise ValueError("A latent token cannot be the first sequence token.")
         embeds = self.get_input_embeddings()(input_ids)
         # Vision tensors are consumed only in the initial prompt segment.
         initial_extra = dict(kwargs)
         cache_extra = {key: value for key, value in kwargs.items()
                        if key not in {"pixel_values", "pixel_values_videos", "image_grid_thw", "video_grid_thw"}}
         cache, chunks, start = None, [], 0
-        for index in range(maximum):
-            end = first + index
+        for index in range(layout.count):
+            end = layout.first + index
             output = self._forward_segment(embeds[:, start:end, :], attention_mask[:, :end],
                                            position_ids[:, start:end], cache,
                                            initial_extra if cache is None else cache_extra)
             chunks.append(output.logits)
             cache = output.past_key_values
             updated = embeds.clone()
-            for batch, row in enumerate(latent_rows):
-                if index < len(row):
-                    position = row[index]
-                    if position != end:
-                        raise ValueError("Latents must be contiguous and aligned by CoconutDataCollator.")
-                    updated[batch, position, :] = output.hidden_states[-1][batch, -1, :]
+            for batch, row in enumerate(layout.rows):
+                updated[batch, row[index], :] = output.hidden_states[-1][batch, -1, :]
             embeds, start = updated, end
 
         output = self._forward_segment(embeds[:, start:, :], attention_mask, position_ids[:, start:], cache, cache_extra)
