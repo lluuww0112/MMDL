@@ -28,6 +28,7 @@ from train.checkpoint import CheckpointManager
 START_LATENT = "<|start-latent|>"
 LATENT = "<|latent|>"
 END_LATENT = "<|end-latent|>"
+GENERATION_EXCLUDED_TOKENS = (START_LATENT, LATENT, END_LATENT)
 
 
 def parse_args() -> argparse.Namespace:
@@ -165,6 +166,11 @@ def main() -> int:
                 top_k=args.top_k,
                 repetition_penalty=args.repetition_penalty,
                 presence_penalty=args.presence_penalty,
+                # COCONUT markers are prompt-only control tokens. vLLM
+                # applies bad_words during sampling, after prefill, so this
+                # keeps them usable as latent inputs while removing their
+                # copied EOS rows from generation candidates.
+                bad_words=list(GENERATION_EXCLUDED_TOKENS),
                 max_tokens=args.max_new_tokens,
                 seed=(args.seed * 100000 + seed_index + index)
                 if args.sample == "per_request" else None,

@@ -31,12 +31,13 @@ class CheckpointManager:
 
     def prepare(self) -> Path:
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        source, destination = Path(self.config_path), self.run_dir / "config.yaml"
-        if source.is_file():
-            shutil.copy2(source, destination)
-        else:
-            import yaml
-            destination.write_text(yaml.safe_dump(dict(self.config), sort_keys=False), encoding="utf-8")
+        # Keep the exact training input, including comments and user formatting.
+        # Re-serialising ``self.config`` would create a subtly different config
+        # and make a checkpoint harder to reproduce.
+        source, destination = Path(self.config_path), self.run_dir / "train.yaml"
+        if not source.is_file():
+            raise FileNotFoundError(f"The training config used for this run was not found: {source}")
+        shutil.copy2(source, destination)
         metadata = self.run_dir / "metadata.json"
         if not metadata.exists():
             metadata.write_text(json.dumps({"created_at": datetime.now(timezone.utc).isoformat()}, indent=2) + "\n", encoding="utf-8")

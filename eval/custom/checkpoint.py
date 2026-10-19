@@ -38,7 +38,7 @@ def resolve_target(target: str | Path) -> Path:
 
 
 def load_training_config(checkpoint_path: str | Path) -> dict[str, Any]:
-    path = Path(checkpoint_path).parent / "config.yaml"
+    path = Path(checkpoint_path).parent / "train.yaml"
     if not path.is_file():
         raise FileNotFoundError(f"{path} is required to restore COCONUT settings.")
     with path.open(encoding="utf-8") as handle:

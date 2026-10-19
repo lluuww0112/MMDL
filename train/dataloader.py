@@ -1,7 +1,13 @@
 """Single-image Qwen3-VL data pipeline for staged COCONUT training.
 
-Each record keeps Meta COCONUT's reasoning fields and adds exactly one image:
-``{"image": "path-or-url", "question": str, "answer": str, "steps": [str]}``.
+Each record has exactly one image and uses the following supervision fields:
+``{"image": ..., "question": str, "original_answer": str, "answer": str,
+"steps": [str, ...]}``.
+
+``original_answer`` is the intact teacher response used for ordinary SFT at
+stage 0. From stage 1 onward, ``steps`` is the ordered reasoning trace and
+``answer`` is the answer-only suffix. ``original_answer`` is optional for
+backward-compatible JSON files and falls back to ``answer``.
 """
 
 from __future__ import annotations
@@ -33,6 +39,7 @@ class TokenizedExample:
     index: int
     question: list[int]
     steps: list[list[int]]
+    original_answer: list[int]
     answer: list[int]
     vision_inputs: dict[str, torch.Tensor]
 
@@ -48,28 +55,27 @@ class CoconutDataset(Dataset[TokenizedExample]):
         return self.examples[index]
 
 
-def _image_source(value: Any, data_dir: Path) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise TypeError("image must be one non-empty local path or URL string.")
+def _image_source(value: Any, data_dir: Path | None) -> Any:
+    """Resolve JSON image paths, while allowing decoded PIL images from HF."""
+    if not isinstance(value, str):
+        if value is None:
+            raise TypeError("image must be a local path, URL, or decoded image.")
+        return value
+    if not value.strip():
+        raise TypeError("image path must be non-empty.")
     if "://" in value or Path(value).is_absolute():
         return value
+    if data_dir is None:
+        raise ValueError("A relative image path requires a JSON data directory.")
     return str((data_dir / value).resolve())
 
 
-def _messages(row: Mapping[str, Any], image: str, min_pixels: int, max_pixels: int, conversation_name: str) -> list[dict[str, Any]]:
-    """Use the same Qwen user-message/template contract as MMMU evaluation."""
-    from model.conversation import get_conversation
-
-    conversation = get_conversation(conversation_name)
-    prompt = conversation.render(row, fallback=str(row["question"]))
-    messages: list[dict[str, Any]] = []
-    if conversation.system_prompt:
-        messages.append({"role": "system", "content": conversation.system_prompt})
-    messages.append({"role": "user", "content": [
+def _messages(row: Mapping[str, Any], image: Any, min_pixels: int, max_pixels: int) -> list[dict[str, Any]]:
+    """Build the native single-image Qwen user message from a training row."""
+    return [{"role": "user", "content": [
         {"type": "image", "image": image, "min_pixels": min_pixels, "max_pixels": max_pixels},
-        {"type": "text", "text": prompt},
-    ]})
-    return messages
+        {"type": "text", "text": str(row["question"])},
+    ]}]
 
 
 def _encode_qwen_prompt(processor: Any, messages: list[dict[str, Any]]) -> tuple[list[int], dict[str, torch.Tensor]]:
@@ -93,31 +99,48 @@ def _encode_qwen_prompt(processor: Any, messages: list[dict[str, Any]]) -> tuple
 
 
 def load_coconut_dataset(path: str | Path, processor: Any, *, min_pixels: int, max_pixels: int,
-                         conversation_name: str = "qwen3_vl_mmmu", max_samples: int | None = None) -> CoconutDataset:
-    """Load official COCONUT reasoning data augmented with one image per sample."""
+                         max_samples: int | None = None, seed: int = 0) -> CoconutDataset:
+    """Load JSON COCONUT data or cached MMFineReason rows with one image each."""
     if min_pixels <= 0 or max_pixels < min_pixels:
         raise ValueError("min_pixels/max_pixels must be positive with min_pixels <= max_pixels.")
-    data_path = Path(path)
-    with data_path.open(encoding="utf-8") as handle:
-        raw = json.load(handle)
-    if not isinstance(raw, list) or not raw:
-        raise ValueError("COCONUT data must be a non-empty JSON list.")
-    raw = raw if max_samples is None else raw[:max_samples]
+    source = str(path)
+    if source == "hf://OpenDataArena/MMFineReason-SFT-123K-Qwen3-VL-235B-Thinking":
+        try:
+            from .prepare_data import iter_coconut_rows, load_mmfinereason_dataset
+        except ImportError:
+            from prepare_data import iter_coconut_rows, load_mmfinereason_dataset
+        raw = iter_coconut_rows(load_mmfinereason_dataset(local_files_only=True), count=max_samples, seed=seed)
+        data_dir: Path | None = None
+    else:
+        data_path = Path(path)
+        with data_path.open(encoding="utf-8") as handle:
+            loaded = json.load(handle)
+        if not isinstance(loaded, list) or not loaded:
+            raise ValueError("COCONUT data must be a non-empty JSON list.")
+        raw = loaded if max_samples is None else loaded[:max_samples]
+        data_dir = data_path.parent
+
     tokenizer, eos = processor.tokenizer, processor.tokenizer.eos_token_id
     examples: list[TokenizedExample] = []
     for index, row in enumerate(raw):
-        required = {"image", "question", "answer", "steps"}
+        required = {"image", "question", "answer"}
         if not isinstance(row, Mapping) or required.difference(row):
-            raise ValueError(f"Example {index} must contain image, question, answer, and steps.")
+            raise ValueError(f"Example {index} must contain image, question, and answer.")
         if not isinstance(row["question"], str) or not isinstance(row["answer"], str):
             raise TypeError(f"Example {index} question and answer must be strings.")
-        if not isinstance(row["steps"], list) or not all(isinstance(step, str) for step in row["steps"]):
+        original_answer = row.get("original_answer", row["answer"])
+        if not isinstance(original_answer, str):
+            raise TypeError(f"Example {index} original_answer must be a string when provided.")
+        steps = row.get("steps", [])
+        if not isinstance(steps, list) or not all(isinstance(step, str) for step in steps):
             raise TypeError(f"Example {index} steps must be a list of strings.")
-        image = _image_source(row["image"], data_path.parent)
-        prompt_ids, vision = _encode_qwen_prompt(processor, _messages(row, image, min_pixels, max_pixels, conversation_name))
+        image = _image_source(row["image"], data_dir)
+        prompt_ids, vision = _encode_qwen_prompt(processor, _messages(row, image, min_pixels, max_pixels))
+        original_answer_tokens = list(tokenizer.encode("### " + original_answer, add_special_tokens=False)) + [eos]
         examples.append(TokenizedExample(
             index=index, question=prompt_ids,
-            steps=[list(tokenizer.encode(step + "\n", add_special_tokens=False)) for step in row["steps"]],
+            steps=[list(tokenizer.encode(step + "\n", add_special_tokens=False)) for step in steps],
+            original_answer=original_answer_tokens,
             answer=list(tokenizer.encode("### " + row["answer"], add_special_tokens=False)) + [eos],
             vision_inputs=vision,
         ))
@@ -132,18 +155,34 @@ def _value(config: Mapping[str, Any] | Any, key: str, default: Any) -> Any:
 
 def make_training_features(dataset: Iterable[TokenizedExample], *, stage: int, config: Mapping[str, Any] | Any,
                            tokens: CoconutSpecialTokens, seed: int = 0, shuffle: bool = False) -> list[dict[str, Any]]:
-    """Replace whole CoT steps with learnable continuous-thought positions."""
+    """Build the staged COCONUT curriculum.
+
+    Stage 0 is normal SFT: the intact ``original_answer`` is predicted with no
+    step splitting or latent markers. At stage ``N >= 1``, reasoning steps
+    1..N are replaced, in that order, by a fixed number of latent positions.
+    The remaining textual reasoning and the answer-only field stay supervised.
+    """
     if stage < 0:
         raise ValueError("stage must be non-negative.")
     c_thought, max_stage = int(_value(config, "c_thought", 1)), int(_value(config, "max_latent_stage", stage))
     if c_thought < 0 or max_stage < 0:
         raise ValueError("Invalid COCONUT curriculum values.")
+    if stage > 0 and c_thought <= 0:
+        raise ValueError("config.coconut.c_thought must be positive from stage 1 onward.")
+    if stage > max_stage:
+        raise ValueError(f"stage {stage} exceeds config.coconut.max_latent_stage ({max_stage}).")
     rng, output = random.Random(seed), []
     for item in dataset:
-        selected = stage
-        skipped = len(item.steps) if selected > max_stage else min(selected, len(item.steps), max_stage)
-        prefix = list(item.question) + [tokens.start_id] + [tokens.latent_id] * (skipped * c_thought) + [tokens.end_id]
-        target = [token for step in item.steps[skipped:] for token in step] + list(item.answer)
+        if stage == 0:
+            prefix, target = list(item.question), list(item.original_answer)
+        else:
+            # Do not reduce the latent count for shorter traces: every sample
+            # must execute the same sequential latent-feedback loop.
+            replaced_steps = stage
+            prefix = (list(item.question) + [tokens.start_id]
+                      + [tokens.latent_id] * (replaced_steps * c_thought)
+                      + [tokens.end_id])
+            target = [token for step_tokens in item.steps[replaced_steps:] for token in step_tokens] + list(item.answer)
         ids = prefix + target
         output.append({"input_ids": ids, "labels": [IGNORE_INDEX] * len(prefix) + target,
                        "attention_mask": [1] * len(ids), "position_ids": list(range(len(ids))),
@@ -156,9 +195,15 @@ def make_training_features(dataset: Iterable[TokenizedExample], *, stage: int, c
 def make_generation_features(dataset: Iterable[TokenizedExample], *, stage: int, config: Mapping[str, Any] | Any,
                              tokens: CoconutSpecialTokens) -> list[dict[str, Any]]:
     c_thought, max_stage = int(_value(config, "c_thought", 1)), int(_value(config, "max_latent_stage", stage))
+    if stage < 0 or max_stage < 0 or stage > max_stage:
+        raise ValueError("Invalid COCONUT generation stage.")
+    if stage > 0 and c_thought <= 0:
+        raise ValueError("config.coconut.c_thought must be positive from stage 1 onward.")
     output = []
     for item in dataset:
-        count = max_stage if bool(_value(config, "pad_latent_to_max", False)) else min(stage, max_stage, len(item.steps))
+        # Keep inference consistent with training: a stage has a fixed latent
+        # count independent of each sample's textual step count.
+        count = max_stage if bool(_value(config, "pad_latent_to_max", False)) else stage
         ids = list(item.question) + [tokens.start_id] + [tokens.latent_id] * (count * c_thought) + [tokens.end_id]
         output.append({"input_ids": ids, "attention_mask": [1] * len(ids), "position_ids": list(range(len(ids))),
                        "vision_inputs": item.vision_inputs, "idx": item.index})

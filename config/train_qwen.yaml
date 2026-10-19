@@ -1,0 +1,38 @@
+# Qwen3-VL settings used by COCONUT training.
+model:
+  path: Qwen/Qwen3-VL-4B-Instruct
+  revision: ebb281ec70b05090aa6165b016eac8ec08e71b17
+  loader: model.model_loader:load_qwen3_vl
+  device: cuda:0
+  device_map: false # false keeps all model weights on the single `device` above.
+  vllm_gpu_utilization: 0.5 # Used with `--backend vllm`; reserve this fraction of each visible GPU.
+  max_model_len: 49152 # vLLM's KV-cache allocation for a single Colab GPU.
+  dtype: bf16
+
+evaluation:
+  revision: 98e6ac0cb9b7b2cd2c991b85a50762edc4aedc68 # Pinned MMMU dataset revision.
+  batch_size: 1
+  num_processes: 1
+  main_process_port: 12346
+
+generation:
+  # Official Qwen3-VL Instruct sampling recipe.
+  do_sample: true
+  temperature: 0.7
+  top_p: 0.8
+  top_k: 20
+  repetition_penalty: 1.0
+  presence_penalty: 1.5
+  seed: 42
+  sample: per_request # global | per_request
+  max_new_tokens: 16384 # official 32768
+
+prompt: # Fixed presets are defined in model/conversation.py.
+  conversation: qwen3_vl_mmmu
+
+image:
+  # Training bounds: 64 to 256 visual tokens at 28x28 pixels per token.
+  # This is intentionally lower than the MMMU evaluation bounds (1280--5120)
+  # so bf16 adapter training fits on a small single GPU.
+  min_pixels: 50176
+  max_pixels: 200704

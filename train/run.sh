@@ -4,7 +4,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TRAIN_CONFIG_PATH="${REPO_ROOT}/config/train.yaml"
-MODEL_CONFIG_PATH="${REPO_ROOT}/config/qwen.yaml"
+MODEL_CONFIG_PATH="${REPO_ROOT}/config/train_qwen.yaml"
 DEVICE=""
 LOAD_CHECKPOINT=""
 SAVE_NAME=""
@@ -16,7 +16,7 @@ Usage: bash train/run.sh [options]
 
 Options:
   --train-config PATH  COCONUT training YAML (default: config/train.yaml)
-  --model-config PATH  Qwen/MMMU model YAML (default: config/qwen.yaml)
+  --model-config PATH  Training Qwen YAML (default: config/train_qwen.yaml)
   --device DEVICE      cuda, cuda:N, or cpu (default: preserve environment)
   --load-checkpoint X  Checkpoint file or history run directory to resume from
   --save-name NAME     New history run name for checkpoints written by this run

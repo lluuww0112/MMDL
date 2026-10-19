@@ -15,7 +15,8 @@ LOAD_FORMAT = "coconut_kradapter"
 _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.self_attn\.(q_proj|k_proj|v_proj|o_proj)$")
 
 
-def _state_adapter_pairs(state: Mapping[str, Any]) -> Iterable[tuple[int, str, Any, Any]]:
+def _state_adapter_pairs(state: Mapping[str, Any], target_modules: tuple[str, ...]
+                         ) -> Iterable[tuple[int, str, Any, Any]]:
     """Yield complete adapter pairs, accepting project and DDP state key forms."""
     pairs: dict[tuple[int, str], tuple[Any, Any]] = {}
     for key, weight in state.items():
@@ -23,7 +24,7 @@ def _state_adapter_pairs(state: Mapping[str, Any]) -> Iterable[tuple[int, str, A
             continue
         prefix = key[:-len(".weight")]
         match = _LAYER_RE.search(prefix)
-        if match is None:
+        if match is None or match.group(2) not in target_modules:
             continue
         v_weight = state.get(f"{prefix}.v_weight")
         if v_weight is None:
@@ -86,7 +87,7 @@ def _merge_kradapter(model: Any, state: Mapping[str, Any], adapter_config: Mappi
     layers = model.language_model.model.layers
     expected = {(index, projection) for index in range(len(layers)) for projection in targets}
     pairs = {(layer_idx, projection): (weight, v_weight)
-             for layer_idx, projection, weight, v_weight in _state_adapter_pairs(state)}
+             for layer_idx, projection, weight, v_weight in _state_adapter_pairs(state, targets)}
     missing = sorted(expected.difference(pairs))
     unexpected = sorted(set(pairs).difference(expected))
     if missing or unexpected:
