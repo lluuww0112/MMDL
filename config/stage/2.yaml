@@ -29,11 +29,14 @@ data:
   # Randomly sample this many valid rows from hf_cache; null uses every row.
   max_train_samples: 5000
   sample_seed: 42
+  min_len: 1000
+  # Maximum answer length retained for training.
+  max_len: 10000
   max_val_samples: null
 
 coconut:
   enabled: true
-  c_thought: 1 # One latent feedback pass per replaced reasoning step.
+  c_thought: 2
   max_latent_stage: 4
   epochs_per_stage: 1
   pad_latent_to_max: false
@@ -44,7 +47,7 @@ training:
   weight_decay: 0.01
   # Uniform micro-batch and accumulation settings across every stage.
   batch_size: 1
-  gradient_accumulation_steps: 4
+  gradient_accumulation_steps: 16
   max_grad_norm: 1.0
   # Recompute selected forward activations during backward to lower peak VRAM.
   gradient_checkpointing: true

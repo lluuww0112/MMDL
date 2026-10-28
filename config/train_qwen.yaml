@@ -31,8 +31,8 @@ prompt: # Fixed presets are defined in model/conversation.py.
   conversation: qwen3_vl_mmmu
 
 image:
-  # Training bounds: 64 to 256 visual tokens at 28x28 pixels per token.
+  # Training bounds: 256 to 1024 visual tokens at 28x28 pixels per token.
   # This is intentionally lower than the MMMU evaluation bounds (1280--5120)
   # so bf16 adapter training fits on a small single GPU.
-  min_pixels: 50176
-  max_pixels: 200704
+  min_pixels: 200704
+  max_pixels: 802816

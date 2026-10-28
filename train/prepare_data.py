@@ -13,7 +13,7 @@ import argparse
 import random
 import re
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 
 DATASET_NAME = "OpenDataArena/MMFineReason-SFT-123K-Qwen3-VL-235B-Thinking"
@@ -144,7 +144,8 @@ def coconut_row(row: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def iter_coconut_rows(dataset: Any, *, count: int | None = None, seed: int = 0) -> Iterator[dict[str, Any]]:
+def iter_coconut_rows(dataset: Any, *, count: int | None = None, seed: int = 0,
+                      predicate: Callable[[dict[str, Any]], bool] | None = None) -> Iterator[dict[str, Any]]:
     """Yield valid COCONUT rows, randomly sampled without exporting files.
 
     A finite ``count`` is sampled in random index order. Rows lacking required
@@ -166,6 +167,8 @@ def iter_coconut_rows(dataset: Any, *, count: int | None = None, seed: int = 0) 
         try:
             converted = coconut_row(dataset[index])
         except (TypeError, ValueError):
+            continue
+        if predicate is not None and not predicate(converted):
             continue
         yield converted
         yielded += 1

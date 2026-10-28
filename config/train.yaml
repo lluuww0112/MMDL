@@ -28,6 +28,7 @@ data:
   # Randomly sample this many valid rows from hf_cache; null uses every row.
   max_train_samples: 1
   sample_seed: 42
+  min_len: 64
   max_val_samples: null
 
 coconut:

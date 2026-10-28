@@ -99,17 +99,36 @@ def _encode_qwen_prompt(processor: Any, messages: list[dict[str, Any]]) -> tuple
 
 
 def load_coconut_dataset(path: str | Path, processor: Any, *, min_pixels: int, max_pixels: int,
-                         max_samples: int | None = None, seed: int = 0) -> CoconutDataset:
+                         max_samples: int | None = None, seed: int = 0,
+                         min_len: int | None = None, max_len: int | None = None) -> CoconutDataset:
     """Load JSON COCONUT data or cached MMFineReason rows with one image each."""
     if min_pixels <= 0 or max_pixels < min_pixels:
         raise ValueError("min_pixels/max_pixels must be positive with min_pixels <= max_pixels.")
+    for name, value in (("min_len", min_len), ("max_len", max_len)):
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value <= 0):
+            raise ValueError(f"{name} must be a positive integer when set.")
+    if min_len is not None and max_len is not None and min_len > max_len:
+        raise ValueError("min_len cannot exceed max_len.")
+    tokenizer, eos = processor.tokenizer, processor.tokenizer.eos_token_id
+
+    def within_response_limit(row: Mapping[str, Any]) -> bool:
+        original_answer = row.get("original_answer", row.get("answer"))
+        if not isinstance(original_answer, str):
+            return False
+        length = len(tokenizer.encode(original_answer, add_special_tokens=False)) + 1
+        return ((min_len is None or length >= min_len)
+                and (max_len is None or length <= max_len))
+
     source = str(path)
     if source == "hf://OpenDataArena/MMFineReason-SFT-123K-Qwen3-VL-235B-Thinking":
         try:
             from .prepare_data import iter_coconut_rows, load_mmfinereason_dataset
         except ImportError:
             from prepare_data import iter_coconut_rows, load_mmfinereason_dataset
-        raw = iter_coconut_rows(load_mmfinereason_dataset(local_files_only=True), count=max_samples, seed=seed)
+        raw = iter_coconut_rows(
+            load_mmfinereason_dataset(local_files_only=True), count=max_samples, seed=seed,
+            predicate=within_response_limit,
+        )
         data_dir: Path | None = None
     else:
         data_path = Path(path)
@@ -117,10 +136,9 @@ def load_coconut_dataset(path: str | Path, processor: Any, *, min_pixels: int, m
             loaded = json.load(handle)
         if not isinstance(loaded, list) or not loaded:
             raise ValueError("COCONUT data must be a non-empty JSON list.")
-        raw = loaded if max_samples is None else loaded[:max_samples]
+        raw = loaded
         data_dir = data_path.parent
 
-    tokenizer, eos = processor.tokenizer, processor.tokenizer.eos_token_id
     examples: list[TokenizedExample] = []
     for index, row in enumerate(raw):
         required = {"image", "question", "answer"}
@@ -131,21 +149,25 @@ def load_coconut_dataset(path: str | Path, processor: Any, *, min_pixels: int, m
         original_answer = row.get("original_answer", row["answer"])
         if not isinstance(original_answer, str):
             raise TypeError(f"Example {index} original_answer must be a string when provided.")
+        if not within_response_limit(row):
+            continue
         steps = row.get("steps", [])
         if not isinstance(steps, list) or not all(isinstance(step, str) for step in steps):
             raise TypeError(f"Example {index} steps must be a list of strings.")
         image = _image_source(row["image"], data_dir)
         prompt_ids, vision = _encode_qwen_prompt(processor, _messages(row, image, min_pixels, max_pixels))
-        original_answer_tokens = list(tokenizer.encode("### " + original_answer, add_special_tokens=False)) + [eos]
+        original_answer_tokens = list(tokenizer.encode(original_answer, add_special_tokens=False)) + [eos]
         examples.append(TokenizedExample(
             index=index, question=prompt_ids,
             steps=[list(tokenizer.encode(step + "\n", add_special_tokens=False)) for step in steps],
             original_answer=original_answer_tokens,
-            answer=list(tokenizer.encode("### " + row["answer"], add_special_tokens=False)) + [eos],
+            answer=list(tokenizer.encode(row["answer"], add_special_tokens=False)) + [eos],
             vision_inputs=vision,
         ))
+        if max_samples is not None and len(examples) >= max_samples:
+            break
     if not examples:
-        raise ValueError("max_samples excluded every data example.")
+        raise ValueError("No data examples remained after validation and length filtering.")
     return CoconutDataset(examples)
 
 

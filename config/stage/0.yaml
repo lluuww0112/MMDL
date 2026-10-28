@@ -26,24 +26,27 @@ data:
   train_path: hf://OpenDataArena/MMFineReason-SFT-123K-Qwen3-VL-235B-Thinking
   val_path: null   # Optional teacher-forced validation loss.
   # Randomly sample this many valid rows from hf_cache; null uses every row.
-  max_train_samples: 3000
-  sample_seed: 42
+  max_train_samples: 5000
   max_val_samples: null
+  sample_seed: 42
+  min_len: 64
+  max_len: 7000
+
 
 coconut:
   enabled: true
   c_thought: 0
   max_latent_stage: 4
-  epochs_per_stage: 3
+  epochs_per_stage: 2
   pad_latent_to_max: false
 
 training:
   optimizer: adamw
-  lr: 1e-4
+  lr: 2e-5
   weight_decay: 0.01
   # Keep the former effective batch size (4) while reducing peak GPU memory.
   batch_size: 1
-  gradient_accumulation_steps: 4
+  gradient_accumulation_steps: 16
   max_grad_norm: 1.0
   # Recompute selected forward activations during backward to lower peak VRAM.
   gradient_checkpointing: true

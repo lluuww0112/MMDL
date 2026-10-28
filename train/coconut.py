@@ -32,6 +32,42 @@ from model.adapter import KRAdapter
 _VISION_ENCODER_ATTRIBUTES = ("visual", "vision_model", "vision_tower", "vision_encoder")
 
 
+def _trace_cuda_memory(phase: str, *, step: int | None = None,
+                       inputs: Mapping[str, Any] | None = None, reset_peak: bool = False) -> None:
+    """Append per-step CUDA allocator metrics when COCONUT_VRAM_PROFILE is set."""
+    output = os.environ.get("COCONUT_VRAM_PROFILE")
+    if not output or not torch.cuda.is_available():
+        return
+    torch.cuda.synchronize()
+    free_bytes, total_bytes = torch.cuda.mem_get_info()
+    event: dict[str, Any] = {
+        "phase": phase,
+        "step": step,
+        "allocated_mib": round(torch.cuda.memory_allocated() / 1024**2, 1),
+        "reserved_mib": round(torch.cuda.memory_reserved() / 1024**2, 1),
+        "peak_allocated_mib": round(torch.cuda.max_memory_allocated() / 1024**2, 1),
+        "peak_reserved_mib": round(torch.cuda.max_memory_reserved() / 1024**2, 1),
+        "driver_free_mib": round(free_bytes / 1024**2, 1),
+        "driver_total_mib": round(total_bytes / 1024**2, 1),
+    }
+    if inputs is not None:
+        input_ids, labels, grid = inputs.get("input_ids"), inputs.get("labels"), inputs.get("image_grid_thw")
+        if isinstance(input_ids, torch.Tensor):
+            event["sequence_tokens"] = int(input_ids.shape[-1])
+        if isinstance(labels, torch.Tensor):
+            event["supervised_tokens"] = int((labels != -100).sum().item())
+        if isinstance(grid, torch.Tensor):
+            event["vision_tokens"] = int((grid.prod(dim=-1).sum() // 4).item())
+    encoded = json.dumps(event, ensure_ascii=False)
+    path = Path(output).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(encoded + "\n")
+    print(f"[cuda-memory] {encoded}", flush=True)
+    if reset_peak:
+        torch.cuda.reset_peak_memory_stats()
+
+
 def _section(config: Mapping[str, Any], key: str) -> dict[str, Any]:
     value = config.get(key, {})
     if not isinstance(value, Mapping):
@@ -270,7 +306,9 @@ class CoconutTrainer(Trainer):
         # Trainer calls model.train() immediately before this method. Restore
         # the intentionally frozen vision tower before its forward pass.
         _keep_vision_encoder_in_eval_mode(getattr(model, "module", model))
+        _trace_cuda_memory("before_forward", step=self.state.global_step, inputs=inputs, reset_peak=True)
         outputs = model(**inputs)
+        _trace_cuda_memory("after_forward", step=self.state.global_step, inputs=inputs)
         loss = getattr(outputs, "loss", None)
         if loss is None:
             raise ValueError("COCONUT model did not return a training loss.")
@@ -323,6 +361,10 @@ class CoconutCheckpointCallback(TrainerCallback):
         self.last_saved_epoch = epoch
         print(f"saved {saved} {numeric_metrics}", flush=True)
 
+    def on_step_end(self, args: TrainingArguments, state: Any, control: Any, **kwargs: Any) -> Any:
+        _trace_cuda_memory("after_optimizer_step", step=state.global_step)
+        return control
+
     def on_epoch_end(self, args: TrainingArguments, state: Any, control: Any, **kwargs: Any) -> Any:
         if not self.has_evaluation:
             self._save(state, kwargs)
@@ -368,13 +410,16 @@ def train(config: Mapping[str, Any], config_path: str | Path, qwen_config_path: 
     adapter_modules = _configure_kradapter(model, adapter_cfg)
     frozen_vision_modules = _freeze_vision_encoder(model)
     special_embedding_parameter = _enable_special_token_embeddings(model, tokens) if adapter_modules else None
+    _trace_cuda_memory("model_ready")
     train_set = load_coconut_dataset(
         train_path, processor, min_pixels=int(image_cfg["min_pixels"]), max_pixels=int(image_cfg["max_pixels"]),
-        max_samples=data_cfg.get("max_train_samples"), seed=sample_seed,
+        max_samples=data_cfg.get("max_train_samples"), seed=sample_seed, max_len=data_cfg.get("max_len"),
+        min_len=data_cfg.get("min_len"),
     )
     val_set = load_coconut_dataset(
         data_cfg["val_path"], processor, min_pixels=int(image_cfg["min_pixels"]), max_pixels=int(image_cfg["max_pixels"]),
-        max_samples=data_cfg.get("max_val_samples"), seed=sample_seed,
+        max_samples=data_cfg.get("max_val_samples"), seed=sample_seed, max_len=data_cfg.get("max_len"),
+        min_len=data_cfg.get("min_len"),
     ) if data_cfg.get("val_path") else None
     collator = CoconutDataCollator(tokenizer.pad_token_id, tokens.latent_id)
 
@@ -516,7 +561,7 @@ def train(config: Mapping[str, Any], config_path: str | Path, qwen_config_path: 
 
 
 def inject_qwen_image_settings(config: Mapping[str, Any], qwen_config_path: str | Path) -> dict[str, Any]:
-    """Inject MMMU Qwen single-image bounds into the COCONUT runtime config."""
+    """Inject Qwen image bounds into the COCONUT runtime config."""
     with Path(qwen_config_path).open(encoding="utf-8") as handle:
         qwen_config = yaml.safe_load(handle)
     if not isinstance(qwen_config, Mapping):
