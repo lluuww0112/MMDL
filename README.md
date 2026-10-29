@@ -4,7 +4,7 @@
   <img src="./asset/image.png" width="40%">
 </p>
 
-프로젝트 디렉토리의 구성은 다음과 같습니다.   
+프로젝트 구성은 다음과 같습니다.   
 주요 디렉토리는 config, eval, train 입니다.
 ```bash
 .
