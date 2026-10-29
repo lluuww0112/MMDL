@@ -1,4 +1,4 @@
-# Multi-modal Deep Learning Projects
+# Multimodal Deep Learning Projects
 
 <p align="center">
   <img src="./asset/image.png" width="40%">
