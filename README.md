@@ -1,10 +1,10 @@
-# Multi-modal Deep Learning Projects
+# Multimodal Deep Learning Projects
 
 <p align="center">
   <img src="./asset/image.png" width="40%">
 </p>
 
-프로젝트 리덱토리의 구성은 다음과 같습니다.   
+프로젝트 구성은 다음과 같습니다.   
 주요 디렉토리는 config, eval, train 입니다.
 ```bash
 .
