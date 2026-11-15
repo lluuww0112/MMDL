@@ -372,8 +372,6 @@ class CoconutQwen3VLForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         if input_ids is None:
             raise ValueError("COCONUT Qwen requires input_ids.")
-        if self.latent_token_id is None:
-            raise RuntimeError("Call configure_coconut() after adding special tokens.")
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
         if position_ids is None:
@@ -382,7 +380,7 @@ class CoconutQwen3VLForConditionalGeneration(Qwen3VLForConditionalGeneration):
         forward_extra = dict(kwargs)
         forward_extra.pop("use_cache", None)
         forward_extra.pop("past_key_values", None)
-        layout = coconut_latent_layout(input_ids, self.latent_token_id)
+        layout = coconut_latent_layout(input_ids, self.latent_token_id) if self.latent_token_id is not None else None
         if layout is None:
             output = super().forward(input_ids=input_ids, attention_mask=attention_mask,
                                      position_ids=position_ids, labels=labels, use_cache=False,

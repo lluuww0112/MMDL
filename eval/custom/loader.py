@@ -129,12 +129,17 @@ def register() -> None:
         def __init__(self, load_config: Any) -> None:
             super().__init__(load_config)
             extra = dict(load_config.model_loader_extra_config)
-            try:
-                self.target = resolve_target(extra.pop("target"))
-                self.token_ids = {name: int(extra.pop(name)) for name in
-                                  ("start_latent_id", "latent_token_id", "end_latent_id")}
-            except KeyError as error:
-                raise ValueError(f"{LOAD_FORMAT} requires model_loader_extra_config.{error.args[0]}.") from error
+            self.target = resolve_target(extra.pop("target"))
+            self.use_coconut_tokens = bool(extra.pop("uses_coconut_tokens", True))
+            self.checkpoint_vocab_size = int(extra.pop("checkpoint_vocab_size"))
+            if self.use_coconut_tokens:
+                try:
+                    self.token_ids = {name: int(extra.pop(name)) for name in
+                                      ("start_latent_id", "latent_token_id", "end_latent_id")}
+                except KeyError as error:
+                    raise ValueError(f"{LOAD_FORMAT} requires model_loader_extra_config.{error.args[0]}.") from error
+            else:
+                self.token_ids = {}
             self.adapter_config = dict(extra.pop("adapter", {}))
             # Keep DefaultModelLoader's input validation for its supported options.
             base_config = dataclasses.replace(load_config, load_format="auto",
@@ -148,7 +153,9 @@ def register() -> None:
             """Resize padded base token/lm-head weights to the COCONUT vocab."""
             import torch
 
-            target_vocab = max(self.token_ids.values()) + 1
+            target_vocab = self.checkpoint_vocab_size
+            if target_vocab < max(self.token_ids.values()) + 1:
+                raise ValueError("Checkpoint vocabulary is too small for the COCONUT marker IDs.")
             eos_id = getattr(model.config, "eos_token_id", None)
             if eos_id is None:
                 eos_id = getattr(getattr(model.config, "text_config", None), "eos_token_id", None)
@@ -158,8 +165,8 @@ def register() -> None:
             for name, tensor in self.base_loader.get_all_weights(model_config, model):
                 if name.endswith(("embed_tokens.weight", "lm_head.weight")) and tensor.ndim == 2:
                     if tensor.shape[0] > target_vocab:
-                        # Qwen config pads vocab rows beyond tokenizer length;
-                        # training resize_token_embeddings removes that padding.
+                        # Preserve Qwen padding rows when the checkpoint retains
+                        # the original model vocabulary size.
                         tensor = tensor[:target_vocab]
                     elif tensor.shape[0] < target_vocab:
                         if eos_id >= tensor.shape[0]:
@@ -171,20 +178,24 @@ def register() -> None:
         def load_weights(self, model: Any, model_config: Any) -> None:
             import torch
 
-            # DefaultModelLoader expects source and destination vocabulary sizes
-            # to be equal. COCONUT adds exactly three marker rows, so extend
-            # base embedding/lm-head tensors with the EOS row before mapping.
-            model.load_weights(self._base_weights_with_marker_rows(model, model_config))
+            # Match base embedding/lm-head rows to the checkpoint vocabulary.
+            # New COCONUT markers normally occupy Qwen padding rows; legacy
+            # checkpoints may have a resized vocabulary.
+            base_weights = (self._base_weights_with_marker_rows(model, model_config)
+                            if self.use_coconut_tokens else self.base_loader.get_all_weights(model_config, model))
+            model.load_weights(base_weights)
             payload = CheckpointManager.load(self.target, map_location="cpu")
             state = payload.get("model_state", {})
             if not isinstance(state, Mapping):
                 raise ValueError(f"COCONUT checkpoint {self.target} has no model_state mapping.")
             with torch.no_grad():
-                _copy_marker_rows(model, state, self.token_ids)
+                if self.use_coconut_tokens:
+                    _copy_marker_rows(model, state, self.token_ids)
                 merged = _merge_kradapter(model, state, self.adapter_config)
-            model.coconut_latent_token_id = self.token_ids["latent_token_id"]
-            model.coconut_start_latent_token_id = self.token_ids["start_latent_id"]
-            model.coconut_end_latent_token_id = self.token_ids["end_latent_id"]
+            if self.use_coconut_tokens:
+                model.coconut_latent_token_id = self.token_ids["latent_token_id"]
+                model.coconut_start_latent_token_id = self.token_ids["start_latent_id"]
+                model.coconut_end_latent_token_id = self.token_ids["end_latent_id"]
             model.coconut_merged_kradapter_count = merged
 
     return None

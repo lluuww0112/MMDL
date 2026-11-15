@@ -176,7 +176,8 @@ def _value(config: Mapping[str, Any] | Any, key: str, default: Any) -> Any:
 
 
 def make_training_features(dataset: Iterable[TokenizedExample], *, stage: int, config: Mapping[str, Any] | Any,
-                           tokens: CoconutSpecialTokens, seed: int = 0, shuffle: bool = False) -> list[dict[str, Any]]:
+                           tokens: CoconutSpecialTokens | None, seed: int = 0,
+                           shuffle: bool = False) -> list[dict[str, Any]]:
     """Build the staged COCONUT curriculum.
 
     Stage 0 is normal SFT: the intact ``original_answer`` is predicted with no
@@ -193,6 +194,8 @@ def make_training_features(dataset: Iterable[TokenizedExample], *, stage: int, c
         raise ValueError("config.coconut.c_thought must be positive from stage 1 onward.")
     if stage > max_stage:
         raise ValueError(f"stage {stage} exceeds config.coconut.max_latent_stage ({max_stage}).")
+    if stage > 0 and tokens is None:
+        raise ValueError("COCONUT special tokens are required from stage 1 onward.")
     rng, output = random.Random(seed), []
     for item in dataset:
         if stage == 0:
@@ -243,7 +246,10 @@ class CoconutDataCollator:
         if not features:
             raise ValueError("Cannot collate an empty batch.")
         rows = [dict(feature) for feature in features]
-        positions = [row["input_ids"].index(self.latent_id) for row in rows if self.latent_id in row["input_ids"]]
+        positions = (
+            [row["input_ids"].index(self.latent_id) for row in rows if self.latent_id in row["input_ids"]]
+            if self.latent_id is not None else []
+        )
         target = max(positions) if positions else None
         for row in rows:
             ids = list(row["input_ids"])

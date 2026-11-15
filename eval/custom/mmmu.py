@@ -9,7 +9,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -76,22 +76,54 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def _prepare_processor(model_path: str, revision: str | None, directory: Path) -> tuple[Any, dict[str, int]]:
-    from transformers import AutoProcessor
+def _checkpoint_embedding_vocab_size(checkpoint: Mapping[str, Any]) -> int:
+    """Return the checkpoint vocabulary rows from its input embedding tensor."""
+    state = checkpoint.get("model_state", {})
+    if not isinstance(state, Mapping):
+        raise ValueError("Checkpoint has no model_state mapping.")
+    rows = [int(value.shape[0]) for name, value in state.items()
+            if name.endswith("embed_tokens.weight") and getattr(value, "ndim", None) == 2]
+    if not rows:
+        raise ValueError("Checkpoint has no rank-2 input embedding tensor.")
+    if len(set(rows)) != 1:
+        raise ValueError(f"Checkpoint has inconsistent input embedding vocabulary sizes: {sorted(set(rows))}.")
+    return rows[0]
+
+
+def _prepare_processor(model_path: str, revision: str | None, directory: Path, *,
+                       checkpoint_vocab_size: int, use_coconut_tokens: bool) -> tuple[Any, dict[str, int] | None]:
+    """Save a processor while preserving the checkpoint vocabulary layout."""
+    from transformers import AutoConfig, AutoProcessor
 
     processor = AutoProcessor.from_pretrained(model_path, revision=revision)
     tokenizer = processor.tokenizer
-    tokenizer.add_special_tokens({"additional_special_tokens": [START_LATENT, LATENT, END_LATENT]})
-    ids = {
-        "start_latent_id": tokenizer.convert_tokens_to_ids(START_LATENT),
-        "latent_token_id": tokenizer.convert_tokens_to_ids(LATENT),
-        "end_latent_id": tokenizer.convert_tokens_to_ids(END_LATENT),
-    }
-    if len(set(ids.values())) != 3:
-        raise RuntimeError("COCONUT marker tokens did not receive distinct tokenizer IDs.")
+    tokenizer_vocab_size = len(tokenizer)
+    model_config = AutoConfig.from_pretrained(model_path, revision=revision)
+    base_vocab_size = int(getattr(getattr(model_config, "text_config", model_config), "vocab_size"))
+    supported_vocab_sizes = {base_vocab_size, tokenizer_vocab_size + 3}
+    if checkpoint_vocab_size not in supported_vocab_sizes:
+        raise ValueError(
+            f"Checkpoint input vocabulary has {checkpoint_vocab_size} rows, but the base model has "
+            f"{base_vocab_size} embedding rows and the tokenizer has {tokenizer_vocab_size} tokens. "
+            f"Expected one of {sorted(supported_vocab_sizes)}."
+        )
+    if not use_coconut_tokens:
+        if checkpoint_vocab_size != base_vocab_size:
+            raise ValueError("A plain-SFT checkpoint must retain the base model embedding vocabulary size.")
+        token_ids = None
+    else:
+        tokenizer.add_special_tokens({"additional_special_tokens": [START_LATENT, LATENT, END_LATENT]})
+        ids = {
+            "start_latent_id": tokenizer.convert_tokens_to_ids(START_LATENT),
+            "latent_token_id": tokenizer.convert_tokens_to_ids(LATENT),
+            "end_latent_id": tokenizer.convert_tokens_to_ids(END_LATENT),
+        }
+        if len(tokenizer) != tokenizer_vocab_size + 3 or len(set(ids.values())) != 3:
+            raise RuntimeError("COCONUT marker tokens do not match the checkpoint vocabulary.")
+        token_ids = ids
     directory.mkdir(parents=True, exist_ok=True)
     processor.save_pretrained(directory)
-    return processor, ids
+    return processor, token_ids
 
 
 def _with_latent_markers(request: dict[str, Any], latent_count: int) -> dict[str, Any]:
@@ -113,7 +145,9 @@ def main() -> int:
     coconut = as_mapping(train_config.get("coconut", {}), "checkpoint config.coconut")
     checkpoint = CheckpointManager.load(target, map_location="cpu")
     stage = checkpoint_stage(checkpoint)
-    latent_count = latent_token_count(coconut, stage)
+    checkpoint_vocab_size = _checkpoint_embedding_vocab_size(checkpoint)
+    uses_coconut_tokens = not (stage == 0 and bool(coconut.get("stage0_plain_sft", False)))
+    latent_count = latent_token_count(coconut, stage) if uses_coconut_tokens else 0
     output_path = (args.output_path or ROOT / "results" / "custom_vllm_mmmu" / target.stem).expanduser()
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -125,7 +159,10 @@ def main() -> int:
 
     register()
     tokenizer_dir = output_path / "coconut_tokenizer"
-    processor, token_ids = _prepare_processor(args.model_path, args.model_revision, tokenizer_dir)
+    processor, token_ids = _prepare_processor(
+        args.model_path, args.model_revision, tokenizer_dir, checkpoint_vocab_size=checkpoint_vocab_size,
+        use_coconut_tokens=uses_coconut_tokens
+    )
 
     from vllm import LLM, SamplingParams
     llm = LLM(
@@ -142,8 +179,9 @@ def main() -> int:
         enforce_eager=args.vllm_enforce_eager,
         worker_cls="eval.custom.runner.CoconutGPUWorker",
         load_format=LOAD_FORMAT,
-        model_loader_extra_config={"target": str(target), "adapter": adapter, **token_ids},
-        hf_overrides=partial(coconut_hf_override, vocab_size=len(processor.tokenizer)),
+        model_loader_extra_config={"target": str(target), "adapter": adapter,
+                                   "uses_coconut_tokens": uses_coconut_tokens, "checkpoint_vocab_size": checkpoint_vocab_size, **(token_ids or {})},
+        hf_overrides=partial(coconut_hf_override, vocab_size=checkpoint_vocab_size),
         limit_mm_per_prompt={"image": 7},
         **extras,
     )
@@ -170,7 +208,7 @@ def main() -> int:
                 # applies bad_words during sampling, after prefill, so this
                 # keeps them usable as latent inputs while removing their
                 # copied EOS rows from generation candidates.
-                bad_words=list(GENERATION_EXCLUDED_TOKENS),
+                bad_words=list(GENERATION_EXCLUDED_TOKENS) if uses_coconut_tokens else [],
                 max_tokens=args.max_new_tokens,
                 seed=(args.seed * 100000 + seed_index + index)
                 if args.sample == "per_request" else None,
@@ -195,6 +233,7 @@ def main() -> int:
     scores_path, summary_path, summary = write_scores(predictions, output_path)
     (output_path / "predictions_meta.json").write_text(json.dumps({
         "target": str(target), "checkpoint_stage": stage, "latent_token_count": latent_count,
+        "uses_coconut_tokens": uses_coconut_tokens, "checkpoint_vocab_size": checkpoint_vocab_size,
         "adapter": adapter,
         "vllm": {"max_num_seqs": args.vllm_max_num_seqs,
                  "tensor_parallel_size": args.vllm_tensor_parallel_size,

@@ -23,13 +23,13 @@ adapter:
 
 data:
   # Loaded from the local Hugging Face cache configured by $HF_HOME (hf_cache).
-  train_path: hf://OpenDataArena/MMFineReason-SFT-123K-Qwen3-VL-235B-Thinking
+  train_path: data/train.json 
   val_path: null   # Optional teacher-forced validation loss.
   # Randomly sample this many valid rows from hf_cache; null uses every row.
-  max_train_samples: 5000
+  max_train_samples: null
   max_val_samples: null
   sample_seed: 42
-  min_len: 64
+  min_len: null
   max_len: 7000
 
 
@@ -37,7 +37,7 @@ coconut:
   enabled: true
   c_thought: 0
   max_latent_stage: 4
-  epochs_per_stage: 2
+  epochs_per_stage: 3
   pad_latent_to_max: false
 
 training:

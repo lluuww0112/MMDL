@@ -8,6 +8,7 @@ MODEL_CONFIG_PATH="${REPO_ROOT}/config/train_qwen.yaml"
 DEVICE=""
 LOAD_CHECKPOINT=""
 SAVE_NAME=""
+STAGE0_PLAIN_SFT=false
 NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
 
 usage() {
@@ -20,6 +21,7 @@ Options:
   --device DEVICE      cuda, cuda:N, or cpu (default: preserve environment)
   --load-checkpoint X  Checkpoint file or history run directory to resume from
   --save-name NAME     New history run name for checkpoints written by this run
+  --stage0-plain-sft   Stage 0 only: do plain SFT without adding COCONUT special tokens
   -h, --help           Show this message
 EOF
 }
@@ -41,6 +43,8 @@ while [[ $# -gt 0 ]]; do
     --save-name)
       [[ $# -ge 2 ]] || { echo "--save-name requires a run name" >&2; exit 2; }
       SAVE_NAME="$2"; shift 2 ;;
+    --stage0-plain-sft)
+      STAGE0_PLAIN_SFT=true; shift ;;
     -h|--help)
       usage; exit 0 ;;
     *)
@@ -78,6 +82,9 @@ if [[ -n "${LOAD_CHECKPOINT}" ]]; then
 fi
 if [[ -n "${SAVE_NAME}" ]]; then
   TRAIN_ARGS+=(--save-name "${SAVE_NAME}")
+fi
+if [[ "${STAGE0_PLAIN_SFT}" == true ]]; then
+  TRAIN_ARGS+=(--stage0-plain-sft)
 fi
 exec torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" \
   -m train.coconut "${TRAIN_ARGS[@]}"

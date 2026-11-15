@@ -28,3 +28,7 @@ openpyxl>=3.1.0
 matplotlib>=3.8.0
 datasets==5.0.1
 qwen_vl_utils==0.0.14
+
+# Google Drive uploader used by utils/colab/launch.py.
+google-api-python-client>=2.0.0
+google-auth-oauthlib>=1.0.0

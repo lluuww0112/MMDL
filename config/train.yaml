@@ -6,8 +6,8 @@ history_dir: ./history
 history:
   # null starts and completes stage 0 only.  Loading a previous run directory
   # automatically resumes its incomplete stage or trains the next completed stage.
-  load_checkpoint: test # Checkpoint file or previous run directory, relative to history_dir.
-  save_name: test1 # New run directory under history_dir.
+  load_checkpoint: null # Checkpoint file or previous run directory, relative to history_dir.
+  save_name: MMDL_SFT # New run directory under history_dir.
 seed: 42 # Model/training seed. `data.sample_seed` controls reproducible dataset sampling.
 
 model:
@@ -33,6 +33,9 @@ data:
 
 coconut:
   enabled: true
+  # Stage 0 only: skip COCONUT token registration/embedding training and run ordinary SFT.
+  # Stage 1 and later still add the tokens automatically when resuming this checkpoint.
+  stage0_plain_sft: true
   c_thought: 1
   max_latent_stage: 4
   epochs_per_stage: 1

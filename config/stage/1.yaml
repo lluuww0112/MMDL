@@ -38,12 +38,12 @@ coconut:
   enabled: true
   c_thought: 2
   max_latent_stage: 4
-  epochs_per_stage: 1
+  epochs_per_stage: 3
   pad_latent_to_max: false
 
 training:
   optimizer: adamw
-  lr: 1e-4
+  lr: 2e-5
   weight_decay: 0.01
   # Uniform micro-batch and accumulation settings across every stage.
   batch_size: 1

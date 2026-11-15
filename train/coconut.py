@@ -7,6 +7,7 @@ import json
 import math
 import os
 import random
+import re
 import shutil
 from pathlib import Path
 from typing import Any, Mapping
@@ -189,11 +190,23 @@ def _data_sample_seed(config: Mapping[str, Any], data_cfg: Mapping[str, Any]) ->
     return seed
 
 
+def _stage0_plain_sft_enabled(coconut_cfg: Mapping[str, Any]) -> bool:
+    """Return whether stage 0 must avoid adding any COCONUT-only tokens."""
+    value = coconut_cfg.get("stage0_plain_sft", False)
+    if not isinstance(value, bool):
+        raise TypeError("config.coconut.stage0_plain_sft must be a boolean.")
+    return value
+
+
 def _special_tokens(model: Any, tokenizer: Any) -> CoconutSpecialTokens:
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.add_special_tokens({"additional_special_tokens": [START_LATENT_TOKEN, LATENT_TOKEN, END_LATENT_TOKEN]})
-    model.resize_token_embeddings(len(tokenizer))
+    # Qwen pads its embedding table beyond the tokenizer length. The marker IDs
+    # occupy those unused rows, so retain every existing Qwen embedding exactly.
+    embedding_vocab_size = model.get_input_embeddings().weight.shape[0]
+    if len(tokenizer) > embedding_vocab_size:
+        model.resize_token_embeddings(len(tokenizer))
     ids = CoconutSpecialTokens(
         start_id=tokenizer.convert_tokens_to_ids(START_LATENT_TOKEN),
         latent_id=tokenizer.convert_tokens_to_ids(LATENT_TOKEN),
@@ -201,11 +214,27 @@ def _special_tokens(model: Any, tokenizer: Any) -> CoconutSpecialTokens:
     )
     # A stable initial embedding is preferable to a randomly initialised marker.
     embeddings = model.get_input_embeddings().weight.data
+    if any(token_id < 0 or token_id >= embeddings.shape[0] for token_id in (ids.start_id, ids.latent_id, ids.end_id)):
+        raise ValueError("COCONUT marker IDs are outside the model input embedding table.")
     reference = tokenizer.eos_token_id
     for token_id in (ids.start_id, ids.latent_id, ids.end_id):
         embeddings[token_id].copy_(embeddings[reference])
     model.configure_coconut(latent_token_id=ids.latent_id, start_latent_id=ids.start_id, end_latent_id=ids.end_id)
     return ids
+
+
+def _enable_input_require_grads(model: Any) -> None:
+    """Keep adapter gradients alive when checkpointing starts from frozen embeddings."""
+    enable = getattr(model, "enable_input_require_grads", None)
+    if callable(enable):
+        enable()
+        return
+    embedding = model.get_input_embeddings()
+
+    def require_grad(_: Any, __: Any, output: torch.Tensor) -> torch.Tensor:
+        return output.requires_grad_(True)
+
+    embedding.register_forward_hook(require_grad)
 
 
 def _enable_special_token_embeddings(model: Any, tokens: CoconutSpecialTokens) -> torch.nn.Parameter:
@@ -236,6 +265,36 @@ def _enable_special_token_embeddings(model: Any, tokens: CoconutSpecialTokens) -
     return weight
 
 
+def _load_model_state(model: Any, state: Mapping[str, Any]) -> None:
+    """Load a checkpoint while preserving newly added COCONUT embedding rows.
+
+    A stage-0 plain-SFT checkpoint has the base tokenizer vocabulary, whereas
+    stage 1 adds three COCONUT tokens. ``strict=False`` does not ignore tensor
+    shape mismatches, so copy the common vocabulary rows and retain the newly
+    initialized rows when transitioning between those two layouts.
+    """
+    expected = model.state_dict()
+    adjusted: dict[str, Any] = {}
+    incompatible: list[str] = []
+    for name, value in state.items():
+        target = expected.get(name)
+        if not isinstance(value, torch.Tensor) or not isinstance(target, torch.Tensor):
+            adjusted[name] = value
+        elif value.shape == target.shape:
+            adjusted[name] = value
+        elif (name.endswith(("embed_tokens.weight", "lm_head.weight"))
+              and value.ndim == target.ndim == 2 and value.shape[1:] == target.shape[1:]):
+            merged = target.detach().clone()
+            row_count = min(value.shape[0], target.shape[0])
+            merged[:row_count].copy_(value[:row_count].to(device=merged.device, dtype=merged.dtype))
+            adjusted[name] = merged
+        else:
+            incompatible.append(f"{name}: checkpoint {tuple(value.shape)} != model {tuple(target.shape)}")
+    if incompatible:
+        raise RuntimeError("Checkpoint has incompatible parameter shapes: " + "; ".join(incompatible))
+    model.load_state_dict(adjusted, strict=False)
+
+
 def _load_state(model: Any, path: str, device: torch.device) -> tuple[int, int, int, Any | None]:
     """Load model state and return checkpoint progress plus its optimizer state.
 
@@ -246,7 +305,7 @@ def _load_state(model: Any, path: str, device: torch.device) -> tuple[int, int, 
     state = checkpoint["model_state"]
     # Meta's original checkpoints can be a base CausalLM state dict.  Our Qwen
     # subclass has the same keys, so non-strict loading supports this warm start.
-    model.load_state_dict(state, strict=False)
+    _load_model_state(model, state)
     progress = checkpoint.get("training_state", {})
     return (
         int(progress.get("stage", 0)),
@@ -287,6 +346,17 @@ def _last_completed_stage(checkpoint_path: str | Path) -> int | None:
     if isinstance(stage, bool) or not isinstance(stage, int) or stage < 0:
         raise ValueError(f"Checkpoint metadata has invalid last_completed_stage: {stage!r}")
     return stage
+
+
+def _resume_stage_hint(checkpoint_path: Path | None) -> int | None:
+    """Infer the stage before model initialization, without loading checkpoint weights."""
+    if checkpoint_path is None:
+        return 0
+    completed_stage = _last_completed_stage(checkpoint_path)
+    if completed_stage is not None:
+        return completed_stage + 1
+    match = re.fullmatch(r"checkpoint_stage(\d+)_epoch\d+\.pt", checkpoint_path.name)
+    return int(match.group(1)) if match else None
 
 
 class CoconutTrainer(Trainer):
@@ -391,6 +461,15 @@ def train(config: Mapping[str, Any], config_path: str | Path, qwen_config_path: 
     train_path = data_cfg.get("train_path")
     if not train_path:
         raise ValueError("config.data.train_path is required; it must point to official COCONUT JSON data.")
+    stage0_plain_sft = _stage0_plain_sft_enabled(coconut_cfg)
+    resume_path = _resolve_checkpoint_path(history_dir, load_checkpoint) if load_checkpoint else None
+    stage_hint = _resume_stage_hint(resume_path)
+    if stage0_plain_sft and stage_hint is None:
+        raise ValueError(
+            "Cannot determine the resumed stage from this checkpoint. "
+            "Use a project checkpoint named checkpoint_stageXX_epochXXXX.pt or a history run directory."
+        )
+    use_plain_sft = stage0_plain_sft and stage_hint == 0
     # Trainer/Accelerate owns process-group setup and DDP wrapping.  Select a
     # local device only for the initial model load; Trainer moves/wraps it.
     rank = int(os.environ.get("RANK", "0"))
@@ -406,10 +485,17 @@ def train(config: Mapping[str, Any], config_path: str | Path, qwen_config_path: 
     )
     model, processor = components.model, components.processor
     tokenizer = processor.tokenizer
-    tokens = _special_tokens(model, tokenizer)
+    tokens = None if use_plain_sft else _special_tokens(model, tokenizer)
     adapter_modules = _configure_kradapter(model, adapter_cfg)
     frozen_vision_modules = _freeze_vision_encoder(model)
-    special_embedding_parameter = _enable_special_token_embeddings(model, tokens) if adapter_modules else None
+    special_embedding_parameter = _enable_special_token_embeddings(model, tokens) if adapter_modules and tokens is not None else None
+    input_require_grads = (
+        bool(training_cfg.get("gradient_checkpointing", False))
+        and bool(adapter_modules)
+        and not model.get_input_embeddings().weight.requires_grad
+    )
+    if input_require_grads:
+        _enable_input_require_grads(model)
     _trace_cuda_memory("model_ready")
     train_set = load_coconut_dataset(
         train_path, processor, min_pixels=int(image_cfg["min_pixels"]), max_pixels=int(image_cfg["max_pixels"]),
@@ -421,7 +507,7 @@ def train(config: Mapping[str, Any], config_path: str | Path, qwen_config_path: 
         max_samples=data_cfg.get("max_val_samples"), seed=sample_seed, max_len=data_cfg.get("max_len"),
         min_len=data_cfg.get("min_len"),
     ) if data_cfg.get("val_path") else None
-    collator = CoconutDataCollator(tokenizer.pad_token_id, tokens.latent_id)
+    collator = CoconutDataCollator(tokenizer.pad_token_id, tokens.latent_id if tokens is not None else None)
 
     trainable_parameters = [parameter for name, parameter in model.named_parameters()
                             if (parameter.requires_grad
@@ -438,9 +524,7 @@ def train(config: Mapping[str, Any], config_path: str | Path, qwen_config_path: 
                                   weight_decay=float(training_cfg.get("weight_decay", 0.01)))
     checkpoint_stage, checkpoint_epoch, global_step = 0, 0, 0
     checkpoint_optimizer_state: Any | None = None
-    resume_path: Path | None = None
     if load_checkpoint:
-        resume_path = _resolve_checkpoint_path(history_dir, load_checkpoint)
         checkpoint_stage, checkpoint_epoch, global_step, checkpoint_optimizer_state = _load_state(
             model, str(resume_path), device
         )
@@ -449,6 +533,11 @@ def train(config: Mapping[str, Any], config_path: str | Path, qwen_config_path: 
     # stage; if interrupted mid-stage, its metadata remains unchanged and the
     # latest checkpoint resumes that same stage.
     stage = (completed_stage + 1) if completed_stage is not None else (checkpoint_stage if resume_path is not None else 0)
+    if use_plain_sft != (stage0_plain_sft and stage == 0):
+        raise RuntimeError(
+            "The checkpoint stage differs from the stage inferred before model initialization; "
+            "cannot safely choose the stage0_plain_sft tokenizer layout."
+        )
     max_stage = int(coconut_cfg.get("max_latent_stage", 0))
     if stage > max_stage:
         if rank == 0:
@@ -476,7 +565,8 @@ def train(config: Mapping[str, Any], config_path: str | Path, qwen_config_path: 
                 print(f"Initialized a fresh optimizer for stage {stage}; did not carry state from stage {checkpoint_stage}.", flush=True)
         print(f"Training COCONUT stage {stage} with Hugging Face Trainer", flush=True)
         if stage == 0:
-            print("Stage 0: supervised on unsplit original_answer (no latent reasoning slots).", flush=True)
+            mode = "plain SFT with no COCONUT special tokens" if use_plain_sft else "SFT with COCONUT tokens initialized"
+            print(f"Stage 0: supervised on unsplit original_answer ({mode}).", flush=True)
         else:
             latent_count = stage * int(coconut_cfg.get("c_thought", 1))
             print(
@@ -488,7 +578,10 @@ def train(config: Mapping[str, Any], config_path: str | Path, qwen_config_path: 
             print(f"Randomly sampling {data_cfg['max_train_samples']} training examples with seed {sample_seed}.", flush=True)
         if adapter_modules:
             print(f"KRAdapter applied to {len(adapter_modules)} Linear layers: {', '.join(adapter_modules)}", flush=True)
-            print("Only <|start-latent|> and <|end-latent|> input-embedding rows are trainable.", flush=True)
+            if tokens is not None:
+                print("Only <|start-latent|> and <|end-latent|> input-embedding rows are trainable.", flush=True)
+            elif input_require_grads:
+                print("Enabled input-embedding output gradients for checkpointed adapter training.", flush=True)
         if frozen_vision_modules:
             print(f"Frozen vision encoder modules: {', '.join(frozen_vision_modules)}", flush=True)
 
@@ -583,6 +676,7 @@ def main() -> None:
     parser.add_argument("--qwen-config", default="config/train_qwen.yaml", help="Training Qwen YAML supplying single-image bounds.")
     parser.add_argument("--load-checkpoint", help="Checkpoint file or history run directory to resume from.")
     parser.add_argument("--save-name", help="New history run name used for checkpoints written by this training run.")
+    parser.add_argument("--stage0-plain-sft", action="store_true", help="Stage 0 only: do plain SFT without COCONUT special tokens.")
     args = parser.parse_args()
     config_path = Path(args.config)
     config = _load_yaml_mapping(config_path, "training config")
@@ -600,6 +694,10 @@ def main() -> None:
     if args.save_name is not None:
         history["save_name"] = args.save_name
     config["history"] = history
+    if args.stage0_plain_sft:
+        coconut = _section(config, "coconut")
+        coconut["stage0_plain_sft"] = True
+        config["coconut"] = coconut
     train(inject_qwen_image_settings(config, args.qwen_config), config_path, args.qwen_config)
 
 
