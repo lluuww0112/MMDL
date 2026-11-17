@@ -265,6 +265,55 @@ def _enable_special_token_embeddings(model: Any, tokens: CoconutSpecialTokens) -
     return weight
 
 
+def _adapter_state_dict(model: Any) -> dict[str, torch.Tensor]:
+    """Return only KRAdapter tensors, never their wrapped Qwen weights."""
+    unwrapped = getattr(model, "module", model)
+    state = unwrapped.state_dict()
+    result: dict[str, torch.Tensor] = {}
+    for module_name, module in unwrapped.named_modules():
+        if isinstance(module, KRAdapter):
+            for parameter_name in ("weight", "v_weight"):
+                name = f"{module_name}.{parameter_name}" if module_name else parameter_name
+                value = state.get(name)
+                if not isinstance(value, torch.Tensor):
+                    raise RuntimeError(f"KRAdapter state is missing {name}.")
+                result[name] = value
+    if not result:
+        raise ValueError("No KRAdapter tensors were found to save.")
+    return result
+
+
+def _special_token_state(model: Any, tokens: CoconutSpecialTokens) -> dict[str, Any]:
+    """Serialize COCONUT marker input rows without saving the Qwen embedding."""
+    weight = model.get_input_embeddings().weight
+    token_ids = {"start_latent_id": tokens.start_id, "latent_token_id": tokens.latent_id,
+                 "end_latent_id": tokens.end_id}
+    ordered_ids = list(token_ids.values())
+    if any(token_id < 0 or token_id >= weight.shape[0] for token_id in ordered_ids):
+        raise ValueError("COCONUT special-token IDs are outside the input embedding table.")
+    indices = torch.tensor(ordered_ids, device=weight.device, dtype=torch.long)
+    return {"token_ids": token_ids,
+            "input_embedding_rows": weight.detach().index_select(0, indices).cpu().clone(),
+            "embedding_vocab_size": int(weight.shape[0])}
+
+
+def _restore_special_token_state(model: Any, saved: Mapping[str, Any],
+                                 tokens: CoconutSpecialTokens | None) -> None:
+    """Restore COCONUT marker rows from an adapter-only checkpoint."""
+    if tokens is None:
+        raise ValueError("Checkpoint has COCONUT special-token state but this run did not add the tokens.")
+    expected_ids = {"start_latent_id": tokens.start_id, "latent_token_id": tokens.latent_id,
+                    "end_latent_id": tokens.end_id}
+    saved_ids, rows = saved.get("token_ids"), saved.get("input_embedding_rows")
+    weight = model.get_input_embeddings().weight
+    if (not isinstance(saved_ids, Mapping)
+            or any(saved_ids.get(name) != token_id for name, token_id in expected_ids.items())
+            or not isinstance(rows, torch.Tensor) or rows.shape != (len(expected_ids), weight.shape[1])):
+        raise ValueError("Checkpoint has invalid COCONUT special-token embeddings.")
+    indices = torch.tensor(list(expected_ids.values()), device=weight.device, dtype=torch.long)
+    with torch.no_grad():
+        weight.index_copy_(0, indices, rows.to(device=weight.device, dtype=weight.dtype))
+
 def _load_model_state(model: Any, state: Mapping[str, Any]) -> None:
     """Load a checkpoint while preserving newly added COCONUT embedding rows.
 
@@ -295,7 +344,8 @@ def _load_model_state(model: Any, state: Mapping[str, Any]) -> None:
     model.load_state_dict(adjusted, strict=False)
 
 
-def _load_state(model: Any, path: str, device: torch.device) -> tuple[int, int, int, Any | None]:
+def _load_state(model: Any, path: str, device: torch.device,
+                tokens: CoconutSpecialTokens | None) -> tuple[int, int, int, Any | None]:
     """Load model state and return checkpoint progress plus its optimizer state.
 
     The caller decides whether the optimizer belongs to the stage being run.
@@ -306,6 +356,11 @@ def _load_state(model: Any, path: str, device: torch.device) -> tuple[int, int, 
     # Meta's original checkpoints can be a base CausalLM state dict.  Our Qwen
     # subclass has the same keys, so non-strict loading supports this warm start.
     _load_model_state(model, state)
+    special_token_state = checkpoint.get("special_token_state")
+    if special_token_state is not None:
+        if not isinstance(special_token_state, Mapping):
+            raise ValueError("Checkpoint special_token_state must be a mapping.")
+        _restore_special_token_state(model, special_token_state, tokens)
     progress = checkpoint.get("training_state", {})
     return (
         int(progress.get("stage", 0)),
@@ -396,12 +451,14 @@ class CoconutCheckpointCallback(TrainerCallback):
     """Write project-compatible checkpoints at the end of each Trainer epoch."""
 
     def __init__(self, *, manager: CheckpointManager, stage: int, epoch_offset: int,
-                 global_step_offset: int, has_evaluation: bool) -> None:
+                 global_step_offset: int, has_evaluation: bool,
+                 tokens: CoconutSpecialTokens | None) -> None:
         self.manager = manager
         self.stage = stage
         self.epoch_offset = epoch_offset
         self.global_step_offset = global_step_offset
         self.has_evaluation = has_evaluation
+        self.tokens = tokens
         self.best_loss = float("inf")
         self.last_saved_epoch: int | None = None
 
@@ -426,6 +483,11 @@ class CoconutCheckpointCallback(TrainerCallback):
             model=kwargs["model"], optimizer=kwargs.get("optimizer"), stage=self.stage, epoch=epoch,
             global_step=self.global_step_offset + state.global_step, metrics=numeric_metrics,
             is_best=score <= self.best_loss,
+            model_state=_adapter_state_dict(kwargs["model"]),
+            special_token_state=(
+                _special_token_state(getattr(kwargs["model"], "module", kwargs["model"]), self.tokens)
+                if self.tokens is not None else None
+            ),
         )
         self.best_loss = min(self.best_loss, score)
         self.last_saved_epoch = epoch
@@ -526,7 +588,7 @@ def train(config: Mapping[str, Any], config_path: str | Path, qwen_config_path: 
     checkpoint_optimizer_state: Any | None = None
     if load_checkpoint:
         checkpoint_stage, checkpoint_epoch, global_step, checkpoint_optimizer_state = _load_state(
-            model, str(resume_path), device
+            model, str(resume_path), device, tokens
         )
     completed_stage = _last_completed_stage(resume_path) if resume_path is not None else None
     # New runs begin at stage 0.  A completed checkpoint advances exactly one
@@ -635,7 +697,7 @@ def train(config: Mapping[str, Any], config_path: str | Path, qwen_config_path: 
     )
     checkpoint_callback = CoconutCheckpointCallback(
         manager=manager, stage=stage, epoch_offset=start_epoch, global_step_offset=global_step,
-        has_evaluation=val_features is not None,
+        has_evaluation=val_features is not None, tokens=tokens,
     )
     trainer = CoconutTrainer(
         model=model,

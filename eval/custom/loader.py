@@ -42,12 +42,26 @@ def _embedding_tensor(state: Mapping[str, Any]) -> Any | None:
     return matches[-1] if matches else None
 
 
-def _copy_marker_rows(model: Any, state: Mapping[str, Any], token_ids: Mapping[str, int]) -> None:
+def _copy_marker_rows(model: Any, checkpoint: Mapping[str, Any], token_ids: Mapping[str, int]) -> None:
     """Restore trained marker rows, or use EOS rows for an explicit dummy run."""
     import torch
 
+    state = checkpoint.get("model_state", {})
+    if not isinstance(state, Mapping):
+        raise ValueError("COCONUT checkpoint has no model_state mapping.")
+    special_token_state = checkpoint.get("special_token_state")
+    saved_ids = special_token_state.get("token_ids") if isinstance(special_token_state, Mapping) else None
+    saved_rows = special_token_state.get("input_embedding_rows") if isinstance(special_token_state, Mapping) else None
+    has_saved_rows = (
+        isinstance(saved_ids, Mapping)
+        and all(saved_ids.get(name) == token_id for name, token_id in token_ids.items())
+        and isinstance(saved_rows, torch.Tensor)
+        and saved_rows.ndim == 2
+        and saved_rows.shape[0] == len(token_ids)
+    )
     source = _embedding_tensor(state)
     embedding = model.language_model.model.embed_tokens.weight
+    has_saved_rows = has_saved_rows and saved_rows.shape[1] == embedding.shape[1]
     eos_id = getattr(model.config, "eos_token_id", None)
     if eos_id is None:
         eos_id = getattr(getattr(model.config, "text_config", None), "eos_token_id", None)
@@ -55,8 +69,10 @@ def _copy_marker_rows(model: Any, state: Mapping[str, Any], token_ids: Mapping[s
         raise ValueError("Qwen config does not provide an EOS token ID for COCONUT marker initialization.")
     eos_id = int(eos_id)
     with torch.no_grad():
-        for token_id in token_ids.values():
-            if source is not None and source.shape[0] > token_id:
+        for row_index, token_id in enumerate(token_ids.values()):
+            if has_saved_rows:
+                embedding[token_id].copy_(saved_rows[row_index].to(device=embedding.device, dtype=embedding.dtype))
+            elif source is not None and source.shape[0] > token_id:
                 embedding[token_id].copy_(source[token_id].to(device=embedding.device, dtype=embedding.dtype))
             else:
                 embedding[token_id].copy_(embedding[eos_id])
@@ -190,7 +206,7 @@ def register() -> None:
                 raise ValueError(f"COCONUT checkpoint {self.target} has no model_state mapping.")
             with torch.no_grad():
                 if self.use_coconut_tokens:
-                    _copy_marker_rows(model, state, self.token_ids)
+                    _copy_marker_rows(model, payload, self.token_ids)
                 merged = _merge_kradapter(model, state, self.adapter_config)
             if self.use_coconut_tokens:
                 model.coconut_latent_token_id = self.token_ids["latent_token_id"]

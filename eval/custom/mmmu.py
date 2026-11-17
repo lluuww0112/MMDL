@@ -77,7 +77,17 @@ def parse_args() -> argparse.Namespace:
 
 
 def _checkpoint_embedding_vocab_size(checkpoint: Mapping[str, Any]) -> int:
-    """Return the checkpoint vocabulary rows from its input embedding tensor."""
+    """Return the checkpoint vocabulary rows from full or adapter-only checkpoints."""
+    model_info = checkpoint.get("model_info")
+    if isinstance(model_info, Mapping):
+        size = model_info.get("input_embedding_vocab_size")
+        if isinstance(size, int) and size > 0:
+            return size
+    special_token_state = checkpoint.get("special_token_state")
+    if isinstance(special_token_state, Mapping):
+        size = special_token_state.get("embedding_vocab_size")
+        if isinstance(size, int) and size > 0:
+            return size
     state = checkpoint.get("model_state", {})
     if not isinstance(state, Mapping):
         raise ValueError("Checkpoint has no model_state mapping.")

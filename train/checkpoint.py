@@ -61,16 +61,35 @@ class CheckpointManager:
 
     def save(self, *, model: Any, optimizer: Any | None, stage: int, epoch: int,
              global_step: int, metrics: Mapping[str, float] | None = None,
-             is_best: bool = False) -> Path:
+             is_best: bool = False, model_state: Mapping[str, Any] | None = None,
+             special_token_state: Mapping[str, Any] | None = None) -> Path:
+        """Save a resumable checkpoint.
+
+        ``model_state`` lets callers persist a parameter-efficient subset of a
+        model state dict instead of the base-model weights. COCONUT uses this
+        for KRAdapter tensors. ``special_token_state`` is intentionally kept
+        separate because COCONUT trains only a few rows of the otherwise
+        frozen input embedding matrix.
+        """
         self.prepare()
         unwrapped = getattr(model, "module", model)
+        model_info: dict[str, Any] = {}
+        get_input_embeddings = getattr(unwrapped, "get_input_embeddings", None)
+        if callable(get_input_embeddings):
+            input_embedding = get_input_embeddings()
+            weight = getattr(input_embedding, "weight", None)
+            if getattr(weight, "ndim", None) == 2:
+                model_info["input_embedding_vocab_size"] = int(weight.shape[0])
         payload = {
-            "format_version": 1,
-            "model_state": unwrapped.state_dict(),
+            "format_version": 2,
+            "model_state": dict(model_state) if model_state is not None else unwrapped.state_dict(),
             "optimizer_state": optimizer.state_dict() if optimizer is not None else None,
             "training_state": {"stage": stage, "epoch": epoch, "global_step": global_step},
             "metrics": dict(metrics or {}),
+            "model_info": model_info,
         }
+        if special_token_state is not None:
+            payload["special_token_state"] = dict(special_token_state)
         output, temporary = self.path_for(stage, epoch), self.path_for(stage, epoch).with_suffix(".tmp")
         _torch().save(payload, temporary)
         temporary.replace(output)

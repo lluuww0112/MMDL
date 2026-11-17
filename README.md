@@ -69,13 +69,14 @@ CUDA_VISIBLE_DEVICES=0 python eval/qwen/mmmu.py \
 # Custom Model
 CUDA_VISIBLE_DEVICES=0 python eval/custom/mmmu.py \
   --config config/qwen.yaml \ # 평가 설정 전달 인자
+  --dtype bf16 \
   --target history/<run-name> # 커스텀 모델 가중치 저장 위치 설정
 ```
 
 # Train
 ```bash
 # 단일 실행시 MMFineReason 다운로드
-python /train/prepare_data.py 
+python ./train/prepare_data.py 
 
 # 학습 실행
 bash train/run.sh \
