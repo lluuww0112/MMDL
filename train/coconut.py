@@ -649,8 +649,11 @@ def train(config: Mapping[str, Any], config_path: str | Path, qwen_config_path: 
 
     batch_size = int(training_cfg.get("batch_size", 1))
     accumulation = int(training_cfg.get("gradient_accumulation_steps", 1))
+    warmup_ratio = float(training_cfg.get("warmup_ratio", 0.0))
     if accumulation <= 0:
         raise ValueError("gradient_accumulation_steps must be positive.")
+    if not 0.0 <= warmup_ratio <= 1.0:
+        raise ValueError("training.warmup_ratio must be in [0, 1].")
     epochs_per_stage = int(coconut_cfg.get("epochs_per_stage", 1))
     if epochs_per_stage <= 0:
         raise ValueError("config.coconut.epochs_per_stage must be positive.")
@@ -687,7 +690,8 @@ def train(config: Mapping[str, Any], config_path: str | Path, qwen_config_path: 
         save_strategy="no",
         logging_strategy="steps",
         logging_steps=int(training_cfg.get("logging_steps", 10)),
-        lr_scheduler_type="constant",
+        lr_scheduler_type=str(training_cfg.get("lr_scheduler_type", "constant")),
+        warmup_ratio=warmup_ratio,
         bf16=bf16,
         fp16=fp16,
         gradient_checkpointing=bool(training_cfg.get("gradient_checkpointing", False)),

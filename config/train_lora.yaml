@@ -7,7 +7,7 @@ history:
   # null starts and completes stage 0 only.  Loading a previous run directory
   # automatically resumes its incomplete stage or trains the next completed stage.
   load_checkpoint: null # Checkpoint file or previous run directory, relative to history_dir.
-  save_name: MMDL_SFT_custom2 # New run directory under history_dir.
+  save_name: MMDL_SFT_custom3_qkv_lora # New run directory under history_dir.
 seed: 42 # Model/training seed. `data.sample_seed` controls reproducible dataset sampling.
 
 model:
@@ -17,13 +17,14 @@ model:
   attn_implementation: sdpa
 
 adapter:
-  type: kradapter
-  scaling: 2 # Official KRAdapter default; internal dimensions are inferred from each base Linear layer.
+  type: lora
+  rank: 16 # Rank r of the trainable B @ A update.
+  alpha: 32 # LoRA scale is alpha / rank.
   target_modules: [q_proj, k_proj, v_proj]
 
 data:
   # Loaded from the local Hugging Face cache configured by $HF_HOME (hf_cache).
-  train_path: ./data/custom2/cot_data.json
+  train_path: ./data/custom3/cot_data.json
   val_path: null   # Optional teacher-forced validation loss.
   # Randomly sample this many valid rows from hf_cache; null uses every row.
   max_train_samples: null
@@ -32,21 +33,21 @@ data:
   max_val_samples: null
 
 coconut:
-  enabled: true
-  # Stage 0 only: skip COCONUT token registration/embedding training and run ordinary SFT.
-  # Stage 1 and later still add the tokens automatically when resuming this checkpoint.
+  enabled: false
+  # train.lora supports ordinary stage-0 SFT only; it adds no latent tokens.
   stage0_plain_sft: true
-  c_thought: 1
-  max_latent_stage: 4
-  epochs_per_stage: 6
+  max_latent_stage: 0
+  epochs_per_stage: 2
   pad_latent_to_max: false
 
 training:
   optimizer: adamw
-  lr: 2e-5
+  lr: 1e-6
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.03
   weight_decay: 0.01
   batch_size: 1
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 32
   max_grad_norm: 1.0
   # Recompute selected forward activations during backward to lower peak VRAM.
   gradient_checkpointing: true

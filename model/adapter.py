@@ -8,22 +8,51 @@ import torch.nn as nn
 
 
 class LoRA(nn.Module):
-    """Low-Rank Adaptation using a learnable rank-factorized update."""
+    """A learnable low-rank weight update.
 
-    def __init__(self, size: Tuple[int, int], rank: int):
+    LoRA represents an additive update for a weight shaped
+    (out_features, in_features) as (B @ A) * (alpha / rank). B
+    is initialized to zero, so adding LoRA does not alter the base model
+    before training begins.
+    """
+
+    def __init__(self, size: Tuple[int, int], rank: int, alpha: float | None = None):
         super().__init__()
-        self.size = size
+        if len(size) != 2 or any(not isinstance(dimension, int) or isinstance(dimension, bool) or dimension <= 0 for dimension in size):
+            raise ValueError("LoRA size must contain two positive integer dimensions.")
+        if not isinstance(rank, int) or isinstance(rank, bool) or rank <= 0:
+            raise ValueError("LoRA rank must be a positive integer.")
+        if alpha is None:
+            alpha = float(rank)
+        if not isinstance(alpha, (int, float)) or isinstance(alpha, bool) or not math.isfinite(alpha) or alpha <= 0:
+            raise ValueError("LoRA alpha must be a finite positive number.")
+
+        self.size = (int(size[0]), int(size[1]))
         self.rank = rank
-        self.B = nn.Parameter(torch.zeros(size[0], rank))
-        self.A = nn.Parameter(torch.zeros(rank, size[1]))
-        torch.nn.init.kaiming_uniform_(self.A, a=math.sqrt(5))
-        torch.nn.init.kaiming_uniform_(self.B, a=math.sqrt(5))
+        self.alpha = float(alpha)
+        self.scaling = self.alpha / self.rank
+        self.B = nn.Parameter(torch.empty(self.size[0], rank))
+        self.A = nn.Parameter(torch.empty(rank, self.size[1]))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        """Initialize factors without changing the unadapted model output."""
+        nn.init.kaiming_uniform_(self.A, a=math.sqrt(5))
+        nn.init.zeros_(self.B)
 
     def update(self, w: torch.Tensor | None = None) -> torch.Tensor:
         return self.get_update(w)
 
     def get_update(self, w: torch.Tensor | None = None) -> torch.Tensor:
-        return self.B @ self.A
+        """Return the scaled additive update in (out_features, in_features) order.
+
+        w is accepted for compatibility with the original adapter API;
+        the update is independent of the base weight.
+        """
+        return (self.B @ self.A) * self.scaling
+
+    def extra_repr(self) -> str:
+        return f"size={self.size}, rank={self.rank}, alpha={self.alpha}"
 
 
 class KRAdapter(nn.Module):

@@ -1,0 +1,53 @@
+# Text-only long-CoT SFT on local open-r1/s1K-1.1 parquet data.
+# Kept in COCONUT stage-0 plain-SFT format for eval/custom/mmmu.py compatibility.
+history_dir: ./history
+history:
+  load_checkpoint: null
+  save_name: qwen3_vl_4b_s1k_1_1_text_only
+seed: 42
+
+model:
+  path: Qwen/Qwen3-VL-4B-Instruct
+  revision: ebb281ec70b05090aa6165b016eac8ec08e71b17
+  dtype: bf16
+  attn_implementation: sdpa
+
+adapter:
+  type: kradapter
+  scaling: 2
+  target_modules: [q_proj, k_proj, v_proj]
+
+data:
+  train_path: ./data/textonly
+  val_path: null
+  max_train_samples: 1000
+  sample_seed: 42
+  min_len: null
+  max_len: 8192
+  max_val_samples: null
+
+# Metadata required by eval/custom/mmmu.py. Training is only this one ordinary
+# SFT stage: no COCONUT marker tokens and no image/video tokens are generated.
+coconut:
+  enabled: true
+  stage0_plain_sft: true
+  c_thought: 1
+  max_latent_stage: 0
+  epochs_per_stage: 6
+  pad_latent_to_max: false
+
+training:
+  optimizer: adamw
+  lr: 1.0e-5
+  lr_scheduler_type: constant
+  warmup_ratio: 0.0
+  weight_decay: 0.01
+  # One process: 1 x 32 accumulation = paper's global batch size 32.
+  # With N GPUs, set accumulation to 32 / N for the same global batch.
+  batch_size: 1
+  gradient_accumulation_steps: 16
+  max_grad_norm: 1.0
+  gradient_checkpointing: true
+  num_workers: 0
+  logging_steps: 1
+  save_every_epochs: 1
