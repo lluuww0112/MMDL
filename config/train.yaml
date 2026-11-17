@@ -19,16 +19,16 @@ model:
 adapter:
   type: kradapter
   scaling: 2 # Official KRAdapter default; internal dimensions are inferred from each base Linear layer.
-  target_modules: [k_proj, v_proj]
+  target_modules: [q_proj, k_proj, v_proj]
 
 data:
   # Loaded from the local Hugging Face cache configured by $HF_HOME (hf_cache).
-  train_path: hf://OpenDataArena/MMFineReason-SFT-123K-Qwen3-VL-235B-Thinking
+  train_path: ./data/custom1/cot_data.json
   val_path: null   # Optional teacher-forced validation loss.
   # Randomly sample this many valid rows from hf_cache; null uses every row.
-  max_train_samples: 1
+  max_train_samples: null
   sample_seed: 42
-  min_len: 64
+  min_len: null
   max_val_samples: null
 
 coconut:
@@ -38,7 +38,7 @@ coconut:
   stage0_plain_sft: true
   c_thought: 1
   max_latent_stage: 4
-  epochs_per_stage: 1
+  epochs_per_stage: 6
   pad_latent_to_max: false
 
 training:
