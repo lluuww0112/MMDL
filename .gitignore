@@ -10,3 +10,4 @@ __pycache__/
 /history
 /data/*
 !/data/download_data.py
+!/export_m3cot_custom3.py
