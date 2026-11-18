@@ -1,8 +1,9 @@
-"""vLLM loader for a base Qwen3-VL model plus a COCONUT checkpoint."""
+"""vLLM loader for a base Qwen3-VL model plus an adapter checkpoint."""
 
 from __future__ import annotations
 
 import dataclasses
+import math
 import re
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -13,6 +14,21 @@ from train.checkpoint import CheckpointManager
 
 LOAD_FORMAT = "coconut_kradapter"
 _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.self_attn\.(q_proj|k_proj|v_proj|o_proj)$")
+
+
+def _adapter_targets(adapter_config: Mapping[str, Any], adapter_name: str) -> tuple[str, ...]:
+    """Validate the Qwen attention projections represented in a checkpoint."""
+    targets = adapter_config.get("target_modules", ("q_proj", "k_proj", "v_proj", "o_proj"))
+    if isinstance(targets, str):
+        targets = (targets,)
+    if not isinstance(targets, (list, tuple)) or not all(isinstance(item, str) for item in targets):
+        raise ValueError("adapter.target_modules must be a list of projection names.")
+    targets = tuple(targets)
+    supported = {"q_proj", "k_proj", "v_proj", "o_proj"}
+    unsupported = set(targets).difference(supported)
+    if unsupported:
+        raise ValueError(f"vLLM {adapter_name} loader does not support target_modules: {sorted(unsupported)}.")
+    return targets
 
 
 def _state_adapter_pairs(state: Mapping[str, Any], target_modules: tuple[str, ...]
@@ -35,6 +51,28 @@ def _state_adapter_pairs(state: Mapping[str, Any], target_modules: tuple[str, ..
         pairs[location] = weight, v_weight
     for (layer_idx, projection), (weight, v_weight) in sorted(pairs.items()):
         yield layer_idx, projection, weight, v_weight
+
+
+def _state_lora_pairs(state: Mapping[str, Any], target_modules: tuple[str, ...]
+                      ) -> Iterable[tuple[int, str, Any, Any]]:
+    """Yield complete LoRA A/B pairs saved by :mod:`train.lora`."""
+    pairs: dict[tuple[int, str], tuple[Any, Any]] = {}
+    for key, a_weight in state.items():
+        if not key.endswith(".lora.A"):
+            continue
+        prefix = key[:-len(".lora.A")]
+        match = _LAYER_RE.search(prefix)
+        if match is None or match.group(2) not in target_modules:
+            continue
+        b_weight = state.get(f"{prefix}.lora.B")
+        if b_weight is None:
+            raise ValueError(f"LoRA checkpoint is missing {prefix}.lora.B.")
+        location = int(match.group(1)), match.group(2)
+        if location in pairs:
+            raise ValueError(f"LoRA checkpoint has duplicate factors for layer {location[0]} {location[1]}.")
+        pairs[location] = a_weight, b_weight
+    for (layer_idx, projection), (a_weight, b_weight) in sorted(pairs.items()):
+        yield layer_idx, projection, a_weight, b_weight
 
 
 def _embedding_tensor(state: Mapping[str, Any]) -> Any | None:
@@ -90,16 +128,7 @@ def _merge_kradapter(model: Any, state: Mapping[str, Any], adapter_config: Mappi
     if adapter_type != "kradapter":
         raise ValueError(f"Unsupported adapter.type: {adapter_type!r}.")
     scaling = float(adapter_config.get("scaling", 2))
-    targets = adapter_config.get("target_modules", ("q_proj", "k_proj", "v_proj", "o_proj"))
-    if isinstance(targets, str):
-        targets = (targets,)
-    if not isinstance(targets, (list, tuple)) or not all(isinstance(item, str) for item in targets):
-        raise ValueError("adapter.target_modules must be a list of projection names.")
-    targets = tuple(targets)
-    supported = {"q_proj", "k_proj", "v_proj", "o_proj"}
-    unsupported = set(targets).difference(supported)
-    if unsupported:
-        raise ValueError(f"vLLM KRAdapter loader does not support target_modules: {sorted(unsupported)}.")
+    targets = _adapter_targets(adapter_config, "KRAdapter")
     layers = model.language_model.model.layers
     expected = {(index, projection) for index in range(len(layers)) for projection in targets}
     pairs = {(layer_idx, projection): (weight, v_weight)
@@ -134,6 +163,82 @@ def _merge_kradapter(model: Any, state: Mapping[str, Any], adapter_config: Mappi
     return merged
 
 
+def _lora_update(a_weight: Any, b_weight: Any, *, out_features: int, in_features: int,
+                 rank: int, alpha: float) -> Any:
+    """Return the project LoRA ``B @ A * (alpha / rank)`` update."""
+    import torch
+
+    if getattr(a_weight, "ndim", None) != 2 or getattr(b_weight, "ndim", None) != 2:
+        raise ValueError("LoRA A and B tensors must both be rank 2.")
+    if a_weight.shape[0] != rank or b_weight.shape[1] != rank:
+        raise ValueError(
+            f"LoRA checkpoint rank does not match adapter.rank={rank}: "
+            f"A={tuple(a_weight.shape)}, B={tuple(b_weight.shape)}."
+        )
+    if tuple(a_weight.shape) != (rank, in_features) or tuple(b_weight.shape) != (out_features, rank):
+        raise ValueError(
+            f"LoRA factor shapes A={tuple(a_weight.shape)}, B={tuple(b_weight.shape)} cannot cover "
+            f"projection shape {(out_features, in_features)} with rank {rank}."
+        )
+    return (b_weight.to(dtype=torch.float32) @ a_weight.to(dtype=torch.float32)) * (alpha / rank)
+
+
+def _merge_lora(model: Any, state: Mapping[str, Any], adapter_config: Mapping[str, Any]) -> int:
+    """Merge ``train.lora`` factors into vLLM's TP=1 Qwen projections."""
+    rank = adapter_config.get("rank")
+    if not isinstance(rank, int) or isinstance(rank, bool) or rank <= 0:
+        raise ValueError("LoRA adapter.rank must be a positive integer.")
+    alpha = adapter_config.get("alpha", rank)
+    if (not isinstance(alpha, (int, float)) or isinstance(alpha, bool)
+            or not math.isfinite(alpha) or alpha <= 0):
+        raise ValueError("LoRA adapter.alpha must be a finite positive number.")
+    targets = _adapter_targets(adapter_config, "LoRA")
+    layers = model.language_model.model.layers
+    expected = {(index, projection) for index in range(len(layers)) for projection in targets}
+    pairs = {(layer_idx, projection): (a_weight, b_weight)
+             for layer_idx, projection, a_weight, b_weight in _state_lora_pairs(state, targets)}
+    missing = sorted(expected.difference(pairs))
+    unexpected = sorted(set(pairs).difference(expected))
+    if missing or unexpected:
+        detail = []
+        if missing:
+            detail.append(f"missing {len(missing)} expected LoRA factor pair(s), e.g. {missing[:3]}")
+        if unexpected:
+            detail.append(f"unexpected {len(unexpected)} LoRA factor pair(s), e.g. {unexpected[:3]}")
+        raise ValueError("LoRA checkpoint/config mismatch: " + "; ".join(detail))
+    merged = 0
+    for (layer_idx, projection), (a_weight, b_weight) in pairs.items():
+        attention = layers[layer_idx].self_attn
+        if projection == "o_proj":
+            destination = attention.o_proj.weight
+            update = _lora_update(a_weight, b_weight, out_features=destination.shape[0],
+                                  in_features=destination.shape[1], rank=rank, alpha=float(alpha))
+            destination.add_(update.to(device=destination.device, dtype=destination.dtype))
+        else:
+            destination = attention.qkv_proj.weight
+            output_size = attention.q_size if projection == "q_proj" else attention.kv_size
+            update = _lora_update(a_weight, b_weight, out_features=output_size,
+                                  in_features=destination.shape[1], rank=rank, alpha=float(alpha))
+            offset = {"q_proj": 0, "k_proj": attention.q_size,
+                      "v_proj": attention.q_size + attention.kv_size}[projection]
+            destination[offset:offset + output_size].add_(update.to(device=destination.device,
+                                                                      dtype=destination.dtype))
+        merged += 1
+    return merged
+
+
+def _merge_adapter(model: Any, state: Mapping[str, Any], adapter_config: Mapping[str, Any]) -> int:
+    """Dispatch by the adapter type recorded in the saved training config."""
+    adapter_type = str(adapter_config.get("type", "none")).lower()
+    if adapter_type in {"", "none"}:
+        return 0
+    if adapter_type == "kradapter":
+        return _merge_kradapter(model, state, adapter_config)
+    if adapter_type == "lora":
+        return _merge_lora(model, state, adapter_config)
+    raise ValueError(f"Unsupported adapter.type: {adapter_type!r}.")
+
+
 def register() -> None:
     """Register the loader lazily after vLLM is importable."""
     from vllm.model_executor.model_loader import register_model_loader
@@ -141,7 +246,7 @@ def register() -> None:
     from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 
     @register_model_loader(LOAD_FORMAT)
-    class CoconutKRAdapterLoader(BaseModelLoader):
+    class CoconutAdapterLoader(BaseModelLoader):
         def __init__(self, load_config: Any) -> None:
             super().__init__(load_config)
             extra = dict(load_config.model_loader_extra_config)
@@ -207,11 +312,11 @@ def register() -> None:
             with torch.no_grad():
                 if self.use_coconut_tokens:
                     _copy_marker_rows(model, payload, self.token_ids)
-                merged = _merge_kradapter(model, state, self.adapter_config)
+                merged = _merge_adapter(model, state, self.adapter_config)
             if self.use_coconut_tokens:
                 model.coconut_latent_token_id = self.token_ids["latent_token_id"]
                 model.coconut_start_latent_token_id = self.token_ids["start_latent_id"]
                 model.coconut_end_latent_token_id = self.token_ids["end_latent_id"]
-            model.coconut_merged_kradapter_count = merged
+            model.coconut_merged_adapter_count = merged
 
     return None

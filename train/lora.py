@@ -378,10 +378,15 @@ def _direct_device(value: str | None) -> str | None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train Qwen3-VL with LoRA stage-0 plain SFT.")
-    parser.add_argument("--config", default="config/train_lora.yaml", help="Path to a LoRA SFT YAML configuration.")
-    parser.add_argument("--qwen-config", default="config/qwen.yaml", help="Qwen YAML supplying single-image bounds.")
+    # Keep both the Python entrypoint names and train/run.sh's public names.
+    parser.add_argument("--config", "--train-config", dest="config", default="config/train_lora.yaml",
+                        help="Path to a LoRA SFT YAML configuration.")
+    parser.add_argument("--qwen-config", "--model-config", dest="qwen_config", default="config/qwen.yaml",
+                        help="Qwen YAML supplying single-image bounds.")
     parser.add_argument("--load-checkpoint", help="Checkpoint file or history run directory to resume from.")
     parser.add_argument("--save-name", help="New history run name for checkpoints written by this run.")
+    parser.add_argument("--stage0-plain-sft", action="store_true",
+                        help="Force ordinary stage-0 SFT (the only LoRA training mode).")
     parser.add_argument("--device", default=None, help="Direct-execution device: cuda, cuda:N, or cpu.")
     args = parser.parse_args()
 
@@ -395,6 +400,11 @@ def main() -> None:
     if args.save_name is not None:
         history["save_name"] = args.save_name
     config["history"] = history
+    if args.stage0_plain_sft:
+        coconut = _section(config, "coconut")
+        coconut["stage0_plain_sft"] = True
+        coconut["max_latent_stage"] = 0
+        config["coconut"] = coconut
     train(
         inject_qwen_image_settings(config, qwen_config_path),
         config_path,

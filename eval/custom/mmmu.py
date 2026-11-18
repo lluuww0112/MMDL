@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate a KRAdapter + COCONUT checkpoint on MMMU through vLLM 0.11."""
+"""Evaluate a LoRA/KRAdapter + COCONUT checkpoint on MMMU through vLLM 0.11."""
 
 from __future__ import annotations
 
