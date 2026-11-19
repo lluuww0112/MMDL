@@ -11,3 +11,4 @@ __pycache__/
 /data/*
 !/data/download_data.py
 !/export_m3cot_custom3.py
+/utils/visualization/artifacts

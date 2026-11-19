@@ -19,7 +19,7 @@ model:
 adapter:
   type: kradapter
   scaling: 2 # Official KRAdapter default; internal dimensions are inferred from each base Linear layer.
-  target_modules: [k_proj, v_proj]
+  target_modules: [q_proj, k_proj, v_proj]
 
 data:
   # Loaded from the local Hugging Face cache configured by $HF_HOME (hf_cache).

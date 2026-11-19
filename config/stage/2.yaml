@@ -19,35 +19,36 @@ model:
 adapter:
   type: kradapter
   scaling: 2 # Official KRAdapter default; internal dimensions are inferred from each base Linear layer.
-  target_modules: [k_proj, v_proj]
+  target_modules: [q_proj, k_proj, v_proj]
 
 data:
   # Loaded from the local Hugging Face cache configured by $HF_HOME (hf_cache).
-  train_path: hf://OpenDataArena/MMFineReason-SFT-123K-Qwen3-VL-235B-Thinking
+  train_path: ./data/custom3/cot_data.json
   val_path: null   # Optional teacher-forced validation loss.
-  conversation: qwen3_vl_mmmu # Same user prompt preset as eval/qwen/mmmu.py.
   # Randomly sample this many valid rows from hf_cache; null uses every row.
-  max_train_samples: 5000
+  max_train_samples: null
   sample_seed: 42
-  min_len: 1000
-  # Maximum answer length retained for training.
-  max_len: 10000
+  min_len: null
   max_val_samples: null
 
 coconut:
   enabled: true
-  c_thought: 2
+  # Stage 0 only: skip COCONUT token registration/embedding training and run ordinary SFT.
+  # Stage 1 and later still add the tokens automatically when resuming this checkpoint.
+  stage0_plain_sft: false
+  c_thought: 1
   max_latent_stage: 4
   epochs_per_stage: 1
   pad_latent_to_max: false
 
 training:
   optimizer: adamw
-  lr: 1e-4
+  lr: 1e-6
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.03
   weight_decay: 0.01
-  # Uniform micro-batch and accumulation settings across every stage.
   batch_size: 1
-  gradient_accumulation_steps: 16
+  gradient_accumulation_steps: 32
   max_grad_norm: 1.0
   # Recompute selected forward activations during backward to lower peak VRAM.
   gradient_checkpointing: true
