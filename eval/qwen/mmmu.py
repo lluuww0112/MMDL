@@ -68,17 +68,20 @@ def config_defaults(path: Path) -> dict:
     }
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(split: str = "validation", *, pro: bool = False) -> argparse.Namespace:
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--config", type=Path, default=ROOT / "config" / "qwen.yaml")
     selected, _ = pre.parse_known_args()
     values = config_defaults(selected.config)
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=f"Native vLLM MMMU-{split} runner with subject-level automatic batching.")
     parser.add_argument("--config", type=Path, default=selected.config)
     parser.add_argument("--model-path", default=values["model_path"])
     parser.add_argument("--model-revision", default=values["revision"])
-    parser.add_argument("--dataset-path", default=DATASET)
-    parser.add_argument("--dataset-revision", default=values["dataset_revision"])
+    parser.add_argument("--dataset-path", default="MMMU/MMMU_Pro" if pro else DATASET)
+    parser.add_argument("--dataset-revision", default=None if pro else values["dataset_revision"])
+    if pro:
+        from eval.custom.mmmu_pro import SUBSETS
+        parser.add_argument("--subset", choices=SUBSETS, default="standard (10 options)")
     parser.add_argument("--backend", "--inference-backend", choices=("vllm",), default="vllm")
     parser.add_argument("--dtype", choices=sorted(DTYPES), default=values["dtype"])
     parser.add_argument("--vllm-gpu-memory-utilization", "--vllm-gpu-util", type=float, default=values["gpu_util"])
@@ -104,8 +107,13 @@ def parse_args() -> argparse.Namespace:
                         help="Name of the fixed prompt preset in model/conversation.py.")
     parser.add_argument("--min-pixels", type=int, default=values["min_pixels"])
     parser.add_argument("--max-pixels", type=int, default=values["max_pixels"])
-    parser.add_argument("--output-path", type=Path, default=ROOT / "results" / "vllm_mmmu" / "qwen3-vl-4b-instruct_mmmu_val")
-    return parser.parse_args()
+    result_dir = "vllm_mmmu_test" if split == "test" else "vllm_mmmu"
+    suffix = "test" if split == "test" else "val"
+    parser.add_argument("--output-path", type=Path, default=None if pro else ROOT / "results" / result_dir / f"qwen3-vl-4b-instruct_mmmu_{suffix}")
+    args = parser.parse_args()
+    if pro and args.output_path is None:
+        args.output_path = ROOT / "results" / "vllm_mmmu_pro" / args.subset.replace(" ", "_") / "test"
+    return args
 
 
 def extra_vllm_args(raw_values: list[str]) -> dict:
@@ -121,9 +129,9 @@ def extra_vllm_args(raw_values: list[str]) -> dict:
     return result
 
 
-def records_for_subject(args: argparse.Namespace, subject: str) -> list[dict]:
+def records_for_subject(args: argparse.Namespace, subject: str, split: str = "validation") -> list[dict]:
     from datasets import load_dataset
-    kwargs = {"split": "validation"}
+    kwargs = {"split": split}
     if args.dataset_path == DATASET:
         kwargs["revision"] = args.dataset_revision
     records = []
@@ -131,8 +139,9 @@ def records_for_subject(args: argparse.Namespace, subject: str) -> list[dict]:
         raw_options = row.get("options")
         options = raw_options if isinstance(raw_options, list) else ast.literal_eval(raw_options) if raw_options else []
         qtype = str(row["question_type"])
-        answer = str(row["answer"]).strip()
-        if qtype != "multiple-choice" and answer.startswith("[") and answer.endswith("]"):
+        answer = row.get("answer")
+        answer = str(answer).strip() if answer is not None else None
+        if answer is not None and qtype != "multiple-choice" and answer.startswith("[") and answer.endswith("]"):
             try:
                 answer = [str(item) for item in ast.literal_eval(answer)]
             except (SyntaxError, ValueError):
@@ -207,8 +216,12 @@ def write_scores(predictions: list[dict], output_path: Path) -> tuple[Path, Path
     return scores_path, summary_path, summary
 
 
-def main() -> int:
-    args = parse_args()
+def main(split: str = "validation", *, pro: bool = False) -> int:
+    args = parse_args(split, pro=pro)
+    if pro:
+        from eval.custom.mmmu_pro import IMAGE_MARKER, input_for_pro_record, load_pro_records
+        split = "test"
+        grouped_records = load_pro_records(args)
     conversation = get_conversation(args.conversation)
     if not args.vllm_max_model_len:
         raise ValueError("Set model.max_model_len in qwen.yaml or pass --vllm-max-model-len.")
@@ -228,7 +241,11 @@ def main() -> int:
         seed=args.seed, tensor_parallel_size=args.vllm_tensor_parallel_size,
         gpu_memory_utilization=args.vllm_gpu_memory_utilization, max_model_len=args.vllm_max_model_len,
         max_num_seqs=args.vllm_max_num_seqs, enforce_eager=args.vllm_enforce_eager,
-        limit_mm_per_prompt={"image": 7}, **extra_vllm_args(args.vllm_arg),
+        limit_mm_per_prompt={"image": max(
+            [7] + [len(record["images_by_index"]) + sum(
+                len(IMAGE_MARKER.findall(text)) for text in [record["question"], *record["options"]])
+                for records in grouped_records.values() for record in records]
+        ) if pro else 7}, **extra_vllm_args(args.vllm_arg),
     )
     predictions, timing = [], {}
     # feature/soogguang's per_request mode uses the dataset-wide index.
@@ -236,9 +253,9 @@ def main() -> int:
     prediction_path = output_path / "predictions.jsonl"
     total_started = time.monotonic()
     with prediction_path.open("w", encoding="utf-8") as handle:
-        for subject in SUBJECTS:
-            records = records_for_subject(args, subject)
-            inputs = [input_for_record(record, processor, args.min_pixels, args.max_pixels, conversation) for record in records]
+        for subject in (grouped_records if pro else SUBJECTS):
+            records = grouped_records[subject] if pro else records_for_subject(args, subject, split=split)
+            inputs = [(input_for_pro_record if pro else input_for_record)(record, processor, args.min_pixels, args.max_pixels, conversation) for record in records]
             temperature = args.temperature if args.do_sample else 0.0
             params = [SamplingParams(
                 temperature=temperature, top_p=args.top_p, top_k=args.top_k,
@@ -263,16 +280,23 @@ def main() -> int:
             handle.flush()
             seed_index += len(records)
             print(f"[vLLM] {subject:40s} {len(records):3d} samples {timing[subject]:7.1f}s")
-    scores_path, summary_path, summary = write_scores(predictions, output_path)
+    if split == "test":
+        from eval.custom.mmmu_test import write_submission
+        submission_path = write_submission(predictions, output_path)
+    if (not pro and split != "test") or (pro and predictions and all(p["answer"] is not None for p in predictions)):
+        scores_path, summary_path, summary = write_scores(predictions, output_path)
     (output_path / "predictions_meta.json").write_text(json.dumps({
         "args": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
-        "num_questions": len(predictions), "timing_sec_by_subject": timing,
+        "dataset_split": split, "num_questions": len(predictions), "timing_sec_by_subject": timing,
         "total_sec": time.monotonic() - total_started,
     }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    macro = summary["overall_macro"]
-    print(f"custom_scoring macro accuracy: {macro * 100:.2f}%" if macro is not None else "custom_scoring macro accuracy: n/a")
     print(f"Saved predictions: {prediction_path}")
-    print(f"Saved custom scoring: {scores_path} and {summary_path}")
+    if split == "test":
+        print(f"Saved test answers: {submission_path}")
+    if (not pro and split != "test") or (pro and predictions and all(p["answer"] is not None for p in predictions)):
+        macro = summary["overall_macro"]
+        print(f"custom_scoring macro accuracy: {macro * 100:.2f}%" if macro is not None else "custom_scoring macro accuracy: n/a")
+        print(f"Saved custom scoring: {scores_path} and {summary_path}")
     return 0
 
 

@@ -31,7 +31,7 @@ END_LATENT = "<|end-latent|>"
 GENERATION_EXCLUDED_TOKENS = (START_LATENT, LATENT, END_LATENT)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(*, pro: bool = False) -> argparse.Namespace:
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--config", type=Path, default=ROOT / "config" / "qwen.yaml")
     selected, _ = pre.parse_known_args()
@@ -41,8 +41,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target", type=Path, required=True)
     parser.add_argument("--model-path", default=values["model_path"])
     parser.add_argument("--model-revision", default=values["revision"])
-    parser.add_argument("--dataset-path", default=DATASET)
-    parser.add_argument("--dataset-revision", default=values["dataset_revision"])
+    parser.add_argument("--dataset-path", default="MMMU/MMMU_Pro" if pro else DATASET)
+    parser.add_argument("--dataset-revision", default=None if pro else values["dataset_revision"])
+    if pro:
+        from eval.custom.mmmu_pro import SUBSETS
+        parser.add_argument("--subset", choices=SUBSETS,
+                            default="standard (10 options)")
     parser.add_argument("--dtype", choices=sorted(DTYPES), default=values["dtype"])
     parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=values["gpu_util"])
     parser.add_argument("--vllm-max-model-len", type=int, default=values["max_model_len"])
@@ -147,8 +151,12 @@ def _with_latent_markers(request: dict[str, Any], latent_count: int) -> dict[str
     return request
 
 
-def main() -> int:
-    args = parse_args()
+def main(split: str = "validation", *, pro: bool = False) -> int:
+    args = parse_args(pro=pro)
+    if pro:
+        split = "test"
+        from eval.custom.mmmu_pro import IMAGE_MARKER, input_for_pro_record, load_pro_records
+        grouped_records = load_pro_records(args)
     target = resolve_target(args.target)
     train_config = load_training_config(target)
     adapter = as_mapping(train_config.get("adapter", {}), "checkpoint config.adapter")
@@ -158,7 +166,12 @@ def main() -> int:
     checkpoint_vocab_size = _checkpoint_embedding_vocab_size(checkpoint)
     uses_coconut_tokens = not (stage == 0 and bool(coconut.get("stage0_plain_sft", False)))
     latent_count = latent_token_count(coconut, stage) if uses_coconut_tokens else 0
-    output_path = (args.output_path or ROOT / "results" / "custom_vllm_mmmu" / target.stem).expanduser()
+    result_dir = ("custom_vllm_mmmu_pro" if pro else
+                  "custom_vllm_mmmu_test" if split == "test" else "custom_vllm_mmmu")
+    default_output = ROOT / "results" / result_dir / target.stem
+    if pro:
+        default_output = default_output / args.subset.replace(" ", "_") / split
+    output_path = (args.output_path or default_output).expanduser()
     output_path.mkdir(parents=True, exist_ok=True)
 
     extras = extra_vllm_args(args.vllm_arg)
@@ -192,7 +205,11 @@ def main() -> int:
         model_loader_extra_config={"target": str(target), "adapter": adapter,
                                    "uses_coconut_tokens": uses_coconut_tokens, "checkpoint_vocab_size": checkpoint_vocab_size, **(token_ids or {})},
         hf_overrides=partial(coconut_hf_override, vocab_size=checkpoint_vocab_size),
-        limit_mm_per_prompt={"image": 7},
+        limit_mm_per_prompt={"image": max(
+            [7] + [len(record["images_by_index"]) + sum(
+                len(IMAGE_MARKER.findall(text)) for text in [record["question"], *record["options"]])
+                for records in grouped_records.values() for record in records]
+        ) if pro else 7},
         **extras,
     )
 
@@ -203,10 +220,11 @@ def main() -> int:
     started_total = time.monotonic()
     seed_index = 0
     with prediction_path.open("w", encoding="utf-8") as handle:
-        for subject in SUBJECTS:
-            records = records_for_subject(args, subject)
+        for subject in (grouped_records if pro else SUBJECTS):
+            records = grouped_records[subject] if pro else records_for_subject(args, subject, split=split)
             inputs = [_with_latent_markers(
-                input_for_record(record, processor, args.min_pixels, args.max_pixels, conversation), latent_count)
+                (input_for_pro_record if pro else input_for_record)(
+                    record, processor, args.min_pixels, args.max_pixels, conversation), latent_count)
                 for record in records]
             params = [SamplingParams(
                 temperature=args.temperature if args.do_sample else 0.0,
@@ -240,9 +258,13 @@ def main() -> int:
             timing[subject] = time.monotonic() - started
             print(f"[COCONUT vLLM] {subject:40s} {len(records):3d} samples {timing[subject]:7.1f}s")
 
-    scores_path, summary_path, summary = write_scores(predictions, output_path)
+    if split == "test":
+        from eval.custom.mmmu_test import write_submission
+        submission_path = write_submission(predictions, output_path)
+    if (not pro and split != "test") or (pro and predictions and all(p["answer"] is not None for p in predictions)):
+        scores_path, summary_path, summary = write_scores(predictions, output_path)
     (output_path / "predictions_meta.json").write_text(json.dumps({
-        "target": str(target), "checkpoint_stage": stage, "latent_token_count": latent_count,
+        "target": str(target), "dataset_split": split, "checkpoint_stage": stage, "latent_token_count": latent_count,
         "uses_coconut_tokens": uses_coconut_tokens, "checkpoint_vocab_size": checkpoint_vocab_size,
         "adapter": adapter,
         "vllm": {"max_num_seqs": args.vllm_max_num_seqs,
@@ -252,10 +274,13 @@ def main() -> int:
         "args": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
         "timing_sec_by_subject": timing, "total_sec": time.monotonic() - started_total,
     }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    macro = summary["overall_macro"]
-    print(f"custom_scoring macro accuracy: {macro * 100:.2f}%" if macro is not None else "custom_scoring macro accuracy: n/a")
     print(f"Saved predictions: {prediction_path}")
-    print(f"Saved custom scoring: {scores_path} and {summary_path}")
+    if split == "test":
+        print(f"Saved test answers: {submission_path}")
+    if (not pro and split != "test") or (pro and predictions and all(p["answer"] is not None for p in predictions)):
+        macro = summary["overall_macro"]
+        print(f"custom_scoring macro accuracy: {macro * 100:.2f}%" if macro is not None else "custom_scoring macro accuracy: n/a")
+        print(f"Saved custom scoring: {scores_path} and {summary_path}")
     return 0
 
 

@@ -73,6 +73,16 @@ CUDA_VISIBLE_DEVICES=0 python eval/custom/mmmu.py \
   --target history/<run-name> # 커스텀 모델 가중치 저장 위치 설정
 ```
 
+MMMU test 분할은 같은 인자를 사용해 실행합니다. 결과 디렉터리에는 원본 응답
+`predictions.jsonl`과 문제 ID별 답변을 담은 `submission.json`이 저장됩니다.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python eval/custom/mmmu_test.py \
+  --config config/qwen.yaml \
+  --dtype bf16 \
+  --target history/<run-name>
+```
+
 # Train
 ```bash
 # 단일 실행시 MMFineReason 다운로드
